@@ -63,7 +63,9 @@ COINGECKO_ETH_URL = (
     "https://api.coingecko.com/api/v3/simple/price"
     "?ids=ethereum&vs_currencies=usd"
 )
-DEFAULT_ETH_USD = Decimal("2000")   # Fallback if CoinGecko is unreachable
+COINBASE_ETH_URL = "https://api.coinbase.com/v2/prices/ETH-USD/spot"
+BINANCE_ETH_URL = "https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT"
+DEFAULT_ETH_USD = Decimal("2000")   # Fallback if all sources are unreachable
 
 
 class OpenSeaProvider(BaseMintProvider):
@@ -91,6 +93,8 @@ class OpenSeaProvider(BaseMintProvider):
         self._base_url = base_url.rstrip("/")
         self._retry = retry_config or RetryConfig()
         self._session: Optional[aiohttp.ClientSession] = None
+        self._cached_eth_price: Optional[Decimal] = None
+        self._cached_eth_time: Optional[float] = None
 
     # ── HTTP session ──────────────────────────────────────────────────────────
 
@@ -261,24 +265,66 @@ class OpenSeaProvider(BaseMintProvider):
 
     async def get_eth_price_usd(self) -> Decimal:
         """
-        Fetch the current ETH/USD price from CoinGecko (public, no auth).
-        Falls back to DEFAULT_ETH_USD on failure.
+        Fetch the current ETH/USD price with multi-source fallback and 5-minute caching.
+        Sources in order:
+          1. In-memory cache (< 5 minutes old)
+          2. CoinGecko
+          3. Coinbase
+          4. Binance
+          5. Previous cached price or DEFAULT_ETH_USD
         """
+        import time
+
+        now = time.time()
+        if self._cached_eth_price and self._cached_eth_time and (now - self._cached_eth_time < 300):
+            return self._cached_eth_price
+
+        timeout = aiohttp.ClientTimeout(total=5)
+
+        # 1. CoinGecko
         try:
-            timeout = aiohttp.ClientTimeout(total=10)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(COINGECKO_ETH_URL) as resp:
-                    resp.raise_for_status()
-                    data = await resp.json()
-                    price = data["ethereum"]["usd"]
-                    return Decimal(str(price))
-        except Exception as exc:
-            log.warning(
-                "[API_ERROR] CoinGecko ETH price fetch failed: %s — using fallback $%s",
-                exc,
-                DEFAULT_ETH_USD,
-            )
-            return DEFAULT_ETH_USD
+                    if resp.status == 200:
+                        data = await resp.json()
+                        price = Decimal(str(data["ethereum"]["usd"]))
+                        self._cached_eth_price = price
+                        self._cached_eth_time = now
+                        return price
+        except Exception:
+            pass
+
+        # 2. Coinbase fallback
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(COINBASE_ETH_URL) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        price = Decimal(str(data["data"]["amount"])).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                        self._cached_eth_price = price
+                        self._cached_eth_time = now
+                        return price
+        except Exception:
+            pass
+
+        # 3. Binance fallback
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(BINANCE_ETH_URL) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        price = Decimal(str(data["price"])).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                        self._cached_eth_price = price
+                        self._cached_eth_time = now
+                        return price
+        except Exception:
+            pass
+
+        if self._cached_eth_price:
+            return self._cached_eth_price
+
+        log.warning("[API_ERROR] All ETH price sources failed — using fallback $%s", DEFAULT_ETH_USD)
+        return DEFAULT_ETH_USD
 
     # ── Normalisation ─────────────────────────────────────────────────────────
 
