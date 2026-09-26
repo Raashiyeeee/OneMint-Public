@@ -18,7 +18,12 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import MintOpportunityDB, NotificationDB, SystemStateDB
+from app.database.models import (
+    BroadcastTargetDB,
+    MintOpportunityDB,
+    NotificationDB,
+    SystemStateDB,
+)
 from app.models.mint import MintOpportunity, MintStatus
 
 log = logging.getLogger(__name__)
@@ -138,6 +143,63 @@ class NotificationRepository:
         stmt = select(NotificationDB).where(NotificationDB.mint_id == mint_id)
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
+
+    async def get_all_by_mint_id(self, mint_id: str) -> list[NotificationDB]:
+        stmt = select(NotificationDB).where(NotificationDB.mint_id == mint_id)
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
+
+class TargetRepository:
+    """Operations for broadcast targets (groups/channels/topics)."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get_all_active(self) -> list[BroadcastTargetDB]:
+        stmt = select(BroadcastTargetDB).where(BroadcastTargetDB.is_active == True)
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def add_target(
+        self, chat_id: int, topic_id: Optional[int] = None, label: Optional[str] = None
+    ) -> BroadcastTargetDB:
+        stmt = select(BroadcastTargetDB).where(
+            BroadcastTargetDB.chat_id == chat_id,
+            BroadcastTargetDB.topic_id == topic_id,
+        )
+        result = await self._session.execute(stmt)
+        target = result.scalar_one_or_none()
+        if target:
+            target.is_active = True
+            if label:
+                target.label = label
+            return target
+
+        target = BroadcastTargetDB(
+            chat_id=chat_id,
+            topic_id=topic_id,
+            label=label,
+            is_active=True,
+        )
+        self._session.add(target)
+        await self._session.flush()
+        return target
+
+    async def remove_target(
+        self, chat_id: int, topic_id: Optional[int] = None
+    ) -> bool:
+        stmt = select(BroadcastTargetDB).where(
+            BroadcastTargetDB.chat_id == chat_id,
+            BroadcastTargetDB.topic_id == topic_id,
+        )
+        result = await self._session.execute(stmt)
+        target = result.scalar_one_or_none()
+        if target:
+            await self._session.delete(target)
+            await self._session.flush()
+            return True
+        return False
 
 
 class SystemStateRepository:

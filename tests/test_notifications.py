@@ -167,3 +167,48 @@ def test_esc_special_chars():
     result = _esc("<b>Bold & Cool</b>")
     assert "&lt;" in result
     assert "&amp;" in result
+
+
+@pytest.mark.asyncio
+async def test_send_to_target_with_and_without_topic():
+    """send_to_target handles both topic thread and general channel/group."""
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=12345))
+    notifier = TelegramNotificationService(bot=bot, chat_id=-100111, topic_id=42)
+
+    mint_db = make_mint_db()
+
+    # With topic
+    msg_id = await notifier.send_to_target(mint_db, chat_id=-100222, topic_id=88)
+    assert msg_id == 12345
+    bot.send_message.assert_called_with(
+        chat_id=-100222,
+        text=_format_alert(mint_db),
+        parse_mode="HTML",
+        disable_web_page_preview=False,
+        message_thread_id=88,
+    )
+
+    # Without topic (e.g. channel or general group)
+    bot.send_message.reset_mock()
+    msg_id2 = await notifier.send_to_target(mint_db, chat_id=-100333, topic_id=None)
+    assert msg_id2 == 12345
+    bot.send_message.assert_called_with(
+        chat_id=-100333,
+        text=_format_alert(mint_db),
+        parse_mode="HTML",
+        disable_web_page_preview=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_target_message():
+    """delete_target_message calls bot.delete_message for given chat and message ID."""
+    bot = AsyncMock()
+    bot.delete_message = AsyncMock(return_value=True)
+    notifier = TelegramNotificationService(bot=bot, chat_id=-100111, topic_id=42)
+
+    res = await notifier.delete_target_message(chat_id=-100222, message_id=54321, mint_id="test-1")
+    assert res is True
+    bot.delete_message.assert_called_once_with(chat_id=-100222, message_id=54321)
+

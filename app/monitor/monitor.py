@@ -323,8 +323,8 @@ class MintMonitor:
 
         async def _send(mint_id: str) -> None:
             from app.database.database import get_session_factory
-            from app.database.models import MintOpportunityDB
-            from app.database.repository import MintRepository, NotificationRepository
+            from app.database.models import MintOpportunityDB, NotificationDB
+            from app.database.repository import MintRepository, NotificationRepository, TargetRepository
             from app.models.mint import MintStatus
             from app.utils.time import utcnow, delete_time
             from sqlalchemy import select
@@ -339,38 +339,61 @@ class MintMonitor:
                 if rec is None:
                     return
 
-                msg_id = await notifier.send_mint_alert(rec)
-                if msg_id is None:
+                targets: list[tuple[int, Optional[int]]] = [
+                    (settings.telegram_group_id, settings.public_mint_topic_id)
+                ]
+                seen = {(settings.telegram_group_id, settings.public_mint_topic_id)}
+                try:
+                    extra = await TargetRepository(session).get_all_active()
+                    for t in extra:
+                        key = (t.chat_id, t.topic_id)
+                        if key not in seen:
+                            seen.add(key)
+                            targets.append(key)
+                except Exception as exc:
+                    log.warning("[BROADCAST] Could not load extra targets: %s", exc)
+
+                sent_messages: list[tuple[int, int, Optional[int]]] = []
+                for chat_id, topic_id in targets:
+                    msg_id = await notifier.send_to_target(rec, chat_id, topic_id)
+                    if msg_id:
+                        sent_messages.append((chat_id, msg_id, topic_id))
+
+                if not sent_messages:
                     await MintRepository(session).update_status(mint_id, MintStatus.FAILED)
                     await session.commit()
                     return
 
-                self.health.notifications_sent += 1
+                self.health.notifications_sent += len(sent_messages)
 
                 mint_start = rec.mint_start_time
                 if mint_start.tzinfo is None:
                     mint_start = mint_start.replace(tzinfo=timezone.utc)
                 del_at = delete_time(mint_start, settings.delete_after_minutes)
 
-                notif = NotificationDB(
-                    id=str(uuid.uuid4()),
-                    mint_id=mint_id,
-                    chat_id=settings.telegram_group_id,
-                    message_id=msg_id,
-                    message_thread_id=settings.public_mint_topic_id,
-                    delete_scheduled_at=del_at,
-                )
-                await NotificationRepository(session).save_notification(notif)
+                primary_msg_id = sent_messages[0][1]
+                notif_repo = NotificationRepository(session)
+                for chat_id, msg_id, topic_id in sent_messages:
+                    notif = NotificationDB(
+                        id=str(uuid.uuid4()),
+                        mint_id=mint_id,
+                        chat_id=chat_id,
+                        message_id=msg_id,
+                        message_thread_id=topic_id,
+                        delete_scheduled_at=del_at,
+                    )
+                    await notif_repo.save_notification(notif)
+
                 await MintRepository(session).update_status(
                     mint_id,
                     MintStatus.NOTIFIED,
-                    {"notification_sent_at": utcnow(), "notification_message_id": msg_id},
+                    {"notification_sent_at": utcnow(), "notification_message_id": primary_msg_id},
                 )
                 await session.commit()
 
             self._scheduler.schedule_deletion(
                 mint_id=mint_id,
-                message_id=msg_id,
+                message_id=primary_msg_id,
                 run_at=del_at,
                 delete_fn=self._make_delete_fn(),
             )
@@ -383,17 +406,30 @@ class MintMonitor:
 
         async def _delete(mint_id: str, message_id: int) -> None:
             from app.database.database import get_session_factory
-            from app.database.repository import MintRepository
+            from app.database.repository import MintRepository, NotificationRepository
             from app.models.mint import MintStatus
             from app.utils.time import utcnow
 
-            deleted = await notifier.delete_mint_alert(message_id, mint_id)
-            if deleted:
-                self.health.deletions += 1
             factory = get_session_factory()
             async with factory() as session:
-                status = MintStatus.DELETED if deleted else MintStatus.FAILED
-                extra = {"deleted_at": utcnow()} if deleted else {}
+                notif_repo = NotificationRepository(session)
+                notifs = await notif_repo.get_all_by_mint_id(mint_id)
+                deleted_any = False
+                for notif in notifs:
+                    if notif.deleted_at is None:
+                        ok = await notifier.delete_target_message(notif.chat_id, notif.message_id, mint_id)
+                        if ok:
+                            notif.deleted_at = utcnow()
+                            deleted_any = True
+
+                if not notifs:
+                    deleted_any = await notifier.delete_mint_alert(message_id, mint_id)
+
+                if deleted_any:
+                    self.health.deletions += 1
+
+                status = MintStatus.DELETED if deleted_any else MintStatus.FAILED
+                extra = {"deleted_at": utcnow()} if deleted_any else {}
                 await MintRepository(session).update_status(mint_id, status, extra)
                 await session.commit()
 

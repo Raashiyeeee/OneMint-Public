@@ -145,7 +145,7 @@ class NotificationDB(Base):
     mint_id: Mapped[str] = mapped_column(String(36), nullable=False)
     chat_id: Mapped[int] = mapped_column(Integer, nullable=False)
     message_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    message_thread_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    message_thread_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sent_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -160,6 +160,33 @@ class NotificationDB(Base):
         return (
             f"<NotificationDB id={self.id!r} mint_id={self.mint_id!r} "
             f"message_id={self.message_id!r}>"
+        )
+
+
+class BroadcastTargetDB(Base):
+    """Destination chat/channel and optional forum topic for alert broadcasting."""
+
+    __tablename__ = "broadcast_targets"
+    __table_args__ = (
+        UniqueConstraint("chat_id", "topic_id", name="uq_target_chat_topic"),
+        Index("ix_target_chat_id", "chat_id"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    chat_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    topic_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    label: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<BroadcastTargetDB id={self.id!r} chat_id={self.chat_id} "
+            f"topic_id={self.topic_id} label={self.label!r}>"
         )
 
 

@@ -33,7 +33,7 @@ import logging
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -167,8 +167,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/setfilter &lt;key&gt; &lt;value&gt; — Change a filter value",
         "/setinterval &lt;time&gt; — Change fetch interval (e.g. 30m, 1h)",
         "",
-        "<b>Testing (Admin)</b>",
-        "/test — Send a mock alert to the topic",
+        "<b>Testing & Destinations (Admin)</b>",
+        "/targets   — List all broadcast groups/channels",
+        "/addtarget &lt;chat_id&gt; [topic_id] [label] — Add destination",
+        "/removetarget &lt;chat_id&gt; [topic_id] — Remove destination",
+        "/test — Send a mock alert to all targets",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -635,8 +638,178 @@ async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── /test ──────────────────────────────────────────────────────────────────────
 
+# ── /targets ───────────────────────────────────────────────────────────────────
+
+async def cmd_targets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /targets — list all broadcast destination groups/channels/topics (admin only)."""
+    if not _admin_check(update, context):
+        if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+        return
+
+    settings = context.bot_data.get("settings")
+    from app.database.database import get_session_factory
+    from app.database.repository import TargetRepository
+
+    factory = get_session_factory()
+    async with factory() as session:
+        extra_targets = await TargetRepository(session).get_all_active()
+
+    lines = [
+        "📢 <b>Broadcast Targets</b>",
+        "Alerts are sent to all active destinations below:",
+        "",
+        "⭐ <b>Primary Target (.env)</b>",
+        f"• Chat ID: <code>{settings.telegram_group_id if settings else 'N/A'}</code>",
+        f"• Topic ID: <code>{settings.public_mint_topic_id if settings else 'N/A'}</code>",
+        "",
+    ]
+
+    if extra_targets:
+        lines.append(f"➕ <b>Additional Destinations ({len(extra_targets)})</b>")
+        for i, t in enumerate(extra_targets, 1):
+            label_str = f" ({t.label})" if t.label else ""
+            topic_str = f"Topic: <code>{t.topic_id}</code>" if t.topic_id else "<i>General / Channel</i>"
+            lines.append(f"{i}. <b>Chat:</b> <code>{t.chat_id}</code> | {topic_str}{label_str}")
+    else:
+        lines.append("<i>No additional targets added yet.</i>")
+
+    lines += [
+        "",
+        "<b>Commands to manage targets:</b>",
+        "• <code>/addtarget &lt;chat_id&gt; [topic_id] [label]</code>",
+        "• <code>/removetarget &lt;chat_id&gt; [topic_id]</code>",
+        "• <code>/test</code> — sends a test alert to all targets",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+# ── /addtarget ─────────────────────────────────────────────────────────────────
+
+async def cmd_addtarget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /addtarget <chat_id> [topic_id] [label] (admin only).
+    Adds a new destination group or channel.
+    """
+    if not _admin_check(update, context):
+        if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "<b>Usage:</b>\n"
+            "<code>/addtarget &lt;chat_id&gt; [topic_id] [label]</code>\n\n"
+            "<b>Examples:</b>\n"
+            "• Group with topic: <code>/addtarget -1001234567890 42 \"VIP Mints\"</code>\n"
+            "• Channel or regular group: <code>/addtarget -1009876543210 0 \"Alpha Channel\"</code>\n"
+            "• Without label: <code>/addtarget -1001234567890 156</code>\n\n"
+            "<i>Note: Make sure the bot is added as an admin in the target group/channel.</i>",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        chat_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid chat_id. It must be an integer (e.g. <code>-1001234567890</code>).", parse_mode="HTML")
+        return
+
+    topic_id: Optional[int] = None
+    label: Optional[str] = None
+
+    if len(args) >= 2:
+        try:
+            val = int(args[1])
+            topic_id = val if val > 0 else None
+            if len(args) >= 3:
+                label = " ".join(args[2:]).strip("\"'")
+        except ValueError:
+            label = " ".join(args[1:]).strip("\"'")
+
+    from app.database.database import get_session_factory
+    from app.database.repository import TargetRepository
+
+    factory = get_session_factory()
+    async with factory() as session:
+        await TargetRepository(session).add_target(
+            chat_id=chat_id, topic_id=topic_id, label=label
+        )
+        await session.commit()
+
+    topic_desc = f"<code>{topic_id}</code>" if topic_id else "<i>General / Channel (No topic)</i>"
+    label_desc = f"<b>{label}</b>" if label else "<i>None</i>"
+
+    await update.message.reply_text(
+        "✅ <b>Broadcast target added!</b>\n\n"
+        f"• <b>Chat ID:</b> <code>{chat_id}</code>\n"
+        f"• <b>Topic ID:</b> {topic_desc}\n"
+        f"• <b>Label:</b> {label_desc}\n\n"
+        "<i>All future qualified mint alerts will now be sent to this destination.</i>\n"
+        "<i>Tip: Run <code>/test</code> to send a test alert.</i>",
+        parse_mode="HTML",
+    )
+    log.info("[TARGET_CONFIG] Target added chat_id=%d topic_id=%s label=%s by user %s", chat_id, topic_id, label, update.effective_user.id)
+
+
+# ── /removetarget ──────────────────────────────────────────────────────────────
+
+async def cmd_removetarget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /removetarget <chat_id> [topic_id] (admin only).
+    """
+    if not _admin_check(update, context):
+        if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "<b>Usage:</b>\n"
+            "<code>/removetarget &lt;chat_id&gt; [topic_id]</code>\n\n"
+            "Run <code>/targets</code> to see active targets.",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        chat_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid chat_id. It must be an integer.", parse_mode="HTML")
+        return
+
+    topic_id: Optional[int] = None
+    if len(args) >= 2:
+        try:
+            val = int(args[1])
+            topic_id = val if val > 0 else None
+        except ValueError:
+            pass
+
+    from app.database.database import get_session_factory
+    from app.database.repository import TargetRepository
+
+    factory = get_session_factory()
+    async with factory() as session:
+        removed = await TargetRepository(session).remove_target(chat_id=chat_id, topic_id=topic_id)
+        await session.commit()
+
+    if removed:
+        await update.message.reply_text(
+            f"✅ Removed target <code>{chat_id}</code> (topic: <code>{topic_id or 'General'}</code>).",
+            parse_mode="HTML",
+        )
+        log.info("[TARGET_CONFIG] Target removed chat_id=%d topic_id=%s by user %s", chat_id, topic_id, update.effective_user.id)
+    else:
+        await update.message.reply_text(
+            f"⚠️ Target <code>{chat_id}</code> (topic: <code>{topic_id or 'General'}</code>) was not found in additional targets list.",
+            parse_mode="HTML",
+        )
+
+
+# ── /test ──────────────────────────────────────────────────────────────────────
+
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /test — send a mock alert to the configured topic (admin only)."""
+    """Handle /test — send a mock alert to all broadcast targets (admin only)."""
     if not _admin_check(update, context):
         if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
         return
@@ -659,21 +832,44 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<i>Test message — not a real mint.</i>"
     )
 
-    try:
-        msg = await context.bot.send_message(
-            chat_id=settings.telegram_group_id,
-            message_thread_id=settings.public_mint_topic_id,
-            text=test_text,
-            parse_mode="HTML",
-        )
-        await update.message.reply_text(
-            f"✅ Test alert posted to topic!\n<code>message_id={msg.message_id}</code>",
-            parse_mode="HTML",
-        )
-        log.info("[TELEGRAM_SENT] Test alert sent message_id=%d", msg.message_id)
-    except Exception as exc:
-        log.error("[TELEGRAM_ERROR] Test alert failed: %s", exc)
-        await update.message.reply_text(f"❌ Test failed: {exc}")
+    from app.database.database import get_session_factory
+    from app.database.repository import TargetRepository
+
+    factory = get_session_factory()
+    async with factory() as session:
+        extra_targets = await TargetRepository(session).get_all_active()
+
+    targets: list[tuple[int, Optional[int], str]] = [
+        (settings.telegram_group_id, settings.public_mint_topic_id, "Primary (.env)")
+    ]
+    seen = {(settings.telegram_group_id, settings.public_mint_topic_id)}
+    for t in extra_targets:
+        key = (t.chat_id, t.topic_id)
+        if key not in seen:
+            seen.add(key)
+            name = t.label or f"Chat {t.chat_id}"
+            targets.append((t.chat_id, t.topic_id, name))
+
+    results = []
+    for chat_id, topic_id, label in targets:
+        try:
+            kwargs = {
+                "chat_id": chat_id,
+                "text": test_text,
+                "parse_mode": "HTML",
+            }
+            if topic_id:
+                kwargs["message_thread_id"] = topic_id
+            msg = await context.bot.send_message(**kwargs)
+            results.append(f"✅ <b>{label}</b> (<code>{chat_id}</code>): message_id=<code>{msg.message_id}</code>")
+        except Exception as exc:
+            results.append(f"❌ <b>{label}</b> (<code>{chat_id}</code>): {exc}")
+
+    lines = [
+        "🧪 <b>Test Alert Broadcast Results</b>",
+        "",
+    ] + results
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 # ── /admins ────────────────────────────────────────────────────────────────────

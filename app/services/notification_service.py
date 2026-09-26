@@ -40,67 +40,88 @@ class TelegramNotificationService:
         self._chat_id = chat_id
         self._topic_id = topic_id
 
-    async def send_mint_alert(
-        self, mint: MintOpportunityDB
+    async def send_to_target(
+        self, mint: MintOpportunityDB, chat_id: int, topic_id: Optional[int] = None
     ) -> Optional[int]:
         """
-        Send a public mint alert to the configured topic.
+        Send a public mint alert to a specific chat/channel and optional topic.
 
-        Returns the Telegram message_id on success, None on failure.
+        Returns message_id on success, None on failure.
         """
         text = _format_alert(mint)
         try:
-            msg = await self._bot.send_message(
-                chat_id=self._chat_id,
-                message_thread_id=self._topic_id,
-                text=text,
-                parse_mode="HTML",
-                disable_web_page_preview=False,
-            )
+            kwargs = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False,
+            }
+            if topic_id:
+                kwargs["message_thread_id"] = topic_id
+
+            msg = await self._bot.send_message(**kwargs)
             log.info(
-                "[TELEGRAM_SENT] mint_id=%s message_id=%d chat_id=%d thread_id=%d",
+                "[TELEGRAM_SENT] mint_id=%s message_id=%d chat_id=%d thread_id=%s",
                 mint.id,
                 msg.message_id,
-                self._chat_id,
-                self._topic_id,
+                chat_id,
+                topic_id,
             )
             return msg.message_id
         except TelegramError as exc:
             log.error(
-                "[TELEGRAM_ERROR] Failed to send alert mint_id=%s error=%s",
+                "[TELEGRAM_ERROR] Failed to send alert mint_id=%s chat_id=%d error=%s",
                 mint.id,
+                chat_id,
                 exc,
             )
             return None
 
-    async def delete_mint_alert(
-        self, message_id: int, mint_id: str
+    async def delete_target_message(
+        self, chat_id: int, message_id: int, mint_id: str
     ) -> bool:
-        """
-        Delete a specific message from the topic.
-
-        Returns True on success, False on failure.
-        Only deletes the exact message stored against this mint.
-        """
+        """Delete a specific message from a given chat/channel."""
         try:
             await self._bot.delete_message(
-                chat_id=self._chat_id,
+                chat_id=chat_id,
                 message_id=message_id,
             )
             log.info(
-                "[TELEGRAM_DELETE] mint_id=%s message_id=%d",
+                "[TELEGRAM_DELETE] mint_id=%s chat_id=%d message_id=%d",
                 mint_id,
+                chat_id,
                 message_id,
             )
             return True
         except TelegramError as exc:
             log.warning(
-                "[TELEGRAM_ERROR] Failed to delete message_id=%d mint_id=%s error=%s",
+                "[TELEGRAM_ERROR] Failed to delete chat_id=%d message_id=%d mint_id=%s error=%s",
+                chat_id,
                 message_id,
                 mint_id,
                 exc,
             )
             return False
+
+    async def send_mint_alert(
+        self, mint: MintOpportunityDB
+    ) -> Optional[int]:
+        """
+        Send a public mint alert to the primary configured topic.
+
+        Returns the Telegram message_id on success, None on failure.
+        """
+        return await self.send_to_target(mint, self._chat_id, self._topic_id)
+
+    async def delete_mint_alert(
+        self, message_id: int, mint_id: str
+    ) -> bool:
+        """
+        Delete a specific message from the primary configured topic.
+
+        Returns True on success, False on failure.
+        """
+        return await self.delete_target_message(self._chat_id, message_id, mint_id)
 
 
 # ---------------------------------------------------------------------------
