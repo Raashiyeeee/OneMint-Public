@@ -1,0 +1,43 @@
+[Unit]
+Description=Public Mint Link Bot — OpenSea NFT mint monitor
+Documentation=https://github.com/your-org/public-mint-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/public-mint-bot
+
+# Load environment from .env file
+EnvironmentFile=/opt/public-mint-bot/.env
+
+# Run the application
+ExecStart=/opt/public-mint-bot/.venv/bin/python -m app.main
+
+# Restart policy — restart on any failure
+Restart=on-failure
+RestartSec=10s
+StartLimitBurst=5
+StartLimitIntervalSec=60s
+
+# Graceful shutdown
+TimeoutStopSec=30s
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Logging — logs go to journald (view with: journalctl -u public-mint-bot -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=public-mint-bot
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/opt/public-mint-bot/data
+
+[Install]
+WantedBy=multi-user.target

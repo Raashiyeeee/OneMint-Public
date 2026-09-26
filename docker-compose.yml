@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+  public-mint-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: public-mint-bot
+    restart: unless-stopped
+
+    # Environment variables — copy .env.example to .env and fill in values
+    env_file:
+      - .env
+
+    # Override specific env vars if needed
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:///./data/public_mint_bot.db
+      - LOG_LEVEL=INFO
+      - TEST_MODE=false
+
+    # Persistent data volume (database files)
+    volumes:
+      - bot_data:/app/data
+
+    # Log configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  bot_data:
+    driver: local
