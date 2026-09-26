@@ -16,7 +16,8 @@ pydantic>=2.9,<3.0
 pydantic-settings>=2.5,<3.0
 
 # ─── Database (SQLite — default, zero config) ─────────────────────────────────
-sqlalchemy>=2.0,<3.0
+sqlalchemy[asyncio]>=2.0,<3.0
+greenlet>=3.0
 aiosqlite>=0.20,<1.0
 
 # ─── Database (PostgreSQL — optional, comment out if not using PostgreSQL) ────
