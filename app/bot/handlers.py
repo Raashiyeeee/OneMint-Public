@@ -28,7 +28,9 @@ Super-admin:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -196,17 +198,50 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     settings = context.bot_data.get("settings")
     enabled = "✅ Enabled" if (monitor and monitor._enabled) else "❌ Paused"
 
+    eth_price = monitor.last_eth_price if monitor else None
+    if eth_price is None and monitor and monitor._provider:
+        try:
+            eth_price = await asyncio.wait_for(monitor._provider.get_eth_price_usd(), timeout=3.0)
+        except Exception:
+            pass
+    eth_str = f"${eth_price:,.2f}" if eth_price else "Unavailable"
+
+    interval_s = settings.poll_interval_seconds if settings else 60
+    interval_m = interval_s / 60
+    interval_str = f"{interval_m:.1f}m ({interval_s}s)" if interval_m >= 1 else f"{interval_s}s"
+
+    last_poll_raw = health.get("last_api_request")
+    last_poll_str = "never"
+    next_poll_str = "N/A"
+    if last_poll_raw and last_poll_raw != "never":
+        try:
+            lp_dt = datetime.fromisoformat(last_poll_raw)
+            now = datetime.now(timezone.utc)
+            ago_s = max(0, int((now - lp_dt).total_seconds()))
+            if ago_s < 60:
+                last_poll_str = f"{lp_dt.strftime('%H:%M:%S UTC')} ({ago_s}s ago)"
+            else:
+                last_poll_str = f"{lp_dt.strftime('%H:%M:%S UTC')} ({ago_s // 60}m ago)"
+
+            remaining = interval_s - ago_s
+            if remaining > 0:
+                next_poll_str = f"in ~{remaining}s" if remaining < 60 else f"in ~{remaining // 60}m"
+            else:
+                next_poll_str = "in progress / due"
+        except Exception:
+            last_poll_str = str(last_poll_raw)
+
     lines = [
         "📊 <b>Bot Status</b>",
         "",
-        f"🤖 Status: <b>Running</b>",
+        "🤖 Status: <b>Running</b>",
         f"📡 Monitoring: <b>{enabled}</b>",
-        f"⏱ Poll Interval: <b>{settings.poll_interval_seconds if settings else 'N/A'}s</b>",
-        f"💰 ETH/USD: checking live...",
+        f"⏱ Poll Interval: <b>{interval_str}</b>",
+        f"⏳ Next Poll: <b>{next_poll_str}</b>",
+        f"💰 ETH/USD: <b>{eth_str}</b>",
         "",
         "📈 <b>Session Metrics</b>",
-        f"Last Poll:      <code>{health.get('last_api_request', 'never')}</code>",
-        f"Last Success:   <code>{health.get('last_success', 'never')}</code>",
+        f"Last Poll:      <code>{last_poll_str}</code>",
         f"API Errors:     {health.get('api_errors', 0)}",
         f"Discovered:     {health.get('discovered', 0)}",
         f"Rejected:       {health.get('rejected', 0)}",

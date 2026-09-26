@@ -18,7 +18,10 @@ import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from app.monitor.monitor import MonitorHealth
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -64,6 +67,7 @@ class MintProcessor:
         scheduler: MintScheduler,
         notifier: TelegramNotificationService,
         eth_price_usd: Decimal,
+        health: Optional[MonitorHealth] = None,
     ) -> None:
         self._settings = settings
         self._provider = provider
@@ -71,6 +75,7 @@ class MintProcessor:
         self._scheduler = scheduler
         self._notifier = notifier
         self._eth_price_usd = eth_price_usd
+        self._health = health
 
         self._filter = MintFilter(
             FilterConfig(
@@ -128,6 +133,8 @@ class MintProcessor:
                 result.rule,
                 result.reason,
             )
+            if self._health:
+                self._health.rejected += 1
             mint.status = MintStatus.REJECTED
             # Save rejected records for auditing (non-blocking)
             try:
@@ -152,6 +159,8 @@ class MintProcessor:
             mint.offer_price_usd,
             mint.minted_percentage,
         )
+        if self._health:
+            self._health.qualified += 1
 
         # ── Step 5: Deduplicate and save ──────────────────────────────────────
         db_record, is_new = await mint_repo.save_mint(mint)
@@ -225,6 +234,9 @@ class MintProcessor:
                 )
                 return
 
+            if self._health:
+                self._health.notifications_sent += 1
+
             notif = NotificationDB(
                 id=str(uuid.uuid4()),
                 mint_id=db_record.id,
@@ -283,6 +295,9 @@ class MintProcessor:
                 await session.commit()
                 return
 
+            if self._health:
+                self._health.notifications_sent += 1
+
             deletion_at = db_record.delete_scheduled_at
             notif = NotificationDB(
                 id=str(uuid.uuid4()),
@@ -316,6 +331,8 @@ class MintProcessor:
         from app.database.database import get_session_factory
 
         deleted = await self._notifier.delete_mint_alert(message_id, mint_id)
+        if deleted and self._health:
+            self._health.deletions += 1
         factory = get_session_factory()
         async with factory() as session:
             status = MintStatus.DELETED if deleted else MintStatus.FAILED

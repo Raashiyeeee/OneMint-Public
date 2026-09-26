@@ -22,6 +22,7 @@ from typing import Optional
 from app.chains.registry import ChainConfig, get_chain
 from app.config import Settings
 from app.database.database import get_session_factory
+from app.database.models import MintOpportunityDB, NotificationDB
 from app.database.repository import SystemStateRepository
 from app.monitor.processor import MintProcessor
 from app.monitor.scheduler import MintScheduler
@@ -86,6 +87,7 @@ class MintMonitor:
         self._stop_event = asyncio.Event()
         self._enabled = True
         self.health = MonitorHealth()
+        self.last_eth_price: Optional[Decimal] = None
 
     async def start(self) -> None:
         """Start the monitoring loop. Runs until stop() is called."""
@@ -159,6 +161,7 @@ class MintMonitor:
 
         # Fetch ETH price once per cycle
         eth_price = await self._provider.get_eth_price_usd()
+        self.last_eth_price = eth_price
 
         log.info(
             "[MONITOR_CYCLE] Polling chains=%s eth_usd=$%s",
@@ -221,6 +224,7 @@ class MintMonitor:
                 scheduler=self._scheduler,
                 notifier=self._notifier,
                 eth_price_usd=eth_price,
+                health=self.health,
             )
             await processor.process(raw_drop, stage)
 
@@ -312,7 +316,7 @@ class MintMonitor:
             "[MONITOR_CYCLE] Recovery complete — recovered %d records", len(records)
         )
 
-    def _make_send_fn(self, record: "MintOpportunityDB"):
+    def _make_send_fn(self, record: MintOpportunityDB):
         """Create a closure for the scheduler to send a notification."""
         notifier = self._notifier
         settings = self._settings
@@ -340,6 +344,8 @@ class MintMonitor:
                     await MintRepository(session).update_status(mint_id, MintStatus.FAILED)
                     await session.commit()
                     return
+
+                self.health.notifications_sent += 1
 
                 mint_start = rec.mint_start_time
                 if mint_start.tzinfo is None:
@@ -382,6 +388,8 @@ class MintMonitor:
             from app.utils.time import utcnow
 
             deleted = await notifier.delete_mint_alert(message_id, mint_id)
+            if deleted:
+                self.health.deletions += 1
             factory = get_session_factory()
             async with factory() as session:
                 status = MintStatus.DELETED if deleted else MintStatus.FAILED
