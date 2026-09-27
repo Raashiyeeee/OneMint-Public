@@ -22,6 +22,8 @@ import logging
 import os
 import signal
 import sys
+import tempfile
+import fcntl
 
 from app.bot.bot import build_application
 from app.config import get_settings
@@ -33,6 +35,32 @@ from app.services.notification_service import TelegramNotificationService
 from app.utils.logging import setup_logging
 
 log = logging.getLogger(__name__)
+
+
+# Module-level PID lock file handle — kept open for the process lifetime
+_pid_lock_fh = None
+
+
+def _acquire_pid_lock() -> None:
+    """Acquire an exclusive flock-based lock to prevent duplicate instances.
+
+    The lock file is placed in the system temp dir so it survives across
+    working-directory changes but is cleaned up on reboot.
+    """
+    global _pid_lock_fh
+    lock_path = os.path.join(tempfile.gettempdir(), "public_mint_bot.lock")
+    _pid_lock_fh = open(lock_path, "w")  # noqa: WPS515
+    try:
+        fcntl.flock(_pid_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _pid_lock_fh.write(str(os.getpid()))
+        _pid_lock_fh.flush()
+    except BlockingIOError:
+        _pid_lock_fh.close()
+        sys.exit(
+            "ERROR: Another instance of Public Mint Bot is already running "
+            f"(lock file: {lock_path}). "
+            "Stop the other instance before starting a new one."
+        )
 
 
 async def run() -> None:
@@ -67,6 +95,14 @@ async def run() -> None:
     tg_app = build_application(settings.telegram_bot_token)
     bot = tg_app.bot
 
+    # Delete any stale webhook — a registered webhook causes Conflict errors
+    # when you switch back to polling without explicitly removing it first.
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+        log.info("[BOT] Stale webhook cleared (if any)")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[BOT] Could not delete webhook: %s", exc)
+
     notifier = TelegramNotificationService(
         bot=bot,
         chat_id=settings.telegram_group_id,
@@ -100,25 +136,51 @@ async def run() -> None:
     # ── Start components ───────────────────────────────────────────────────────
     async with tg_app:
         await tg_app.start()
-        await tg_app.updater.start_polling(drop_pending_updates=True)
-        log.info("[BOT] Telegram polling started")
+
+        webhook_url = (settings.webhook_url or "").rstrip("/")
+        web_runner = None
+
+        if webhook_url:
+            # ── Webhook mode (Render / any cloud host with public HTTPS) ───────
+            # Telegram pushes updates to us — no polling loop, no Conflict errors,
+            # and it works safely even if the service briefly restarts during deploy.
+            #
+            # The bot token is embedded in the path as a secret suffix so the
+            # endpoint is not guessable by outsiders.
+            webhook_path = f"/webhook/{settings.telegram_bot_token}"
+            full_webhook_url = f"{webhook_url}{webhook_path}"
+
+            await tg_app.updater.start_webhook(
+                listen="0.0.0.0",
+                port=settings.webhook_port,
+                url_path=webhook_path,
+                webhook_url=full_webhook_url,
+                drop_pending_updates=True,
+                allowed_updates=["message", "callback_query"],
+            )
+            log.info("[BOT] Webhook mode active → %s (port %d)", full_webhook_url, settings.webhook_port)
+
+        else:
+            # ── Polling mode (local dev, Docker, systemd) ──────────────────────
+            await tg_app.updater.start_polling(drop_pending_updates=True)
+            log.info("[BOT] Polling mode active")
+
+            # Optional standalone health-check endpoint for cloud hosts that
+            # require an HTTP ping but don't provide HTTPS (PORT env var).
+            port = int(os.environ.get("PORT", "0"))
+            if port > 0:
+                import aiohttp.web
+                health_app = aiohttp.web.Application()
+                health_app.router.add_get("/", lambda r: aiohttp.web.Response(text="Bot is running!"))
+                health_app.router.add_get("/health", lambda r: aiohttp.web.Response(text="OK"))
+                web_runner = aiohttp.web.AppRunner(health_app)
+                await web_runner.setup()
+                site = aiohttp.web.TCPSite(web_runner, "0.0.0.0", port)
+                await site.start()
+                log.info("[WEB] Health check server listening on port %d", port)
 
         # Start monitor in background
         monitor_task = asyncio.create_task(monitor.start(), name="monitor")
-
-        # Optional health check server for cloud hosting (Render, Koyeb, Railway)
-        port = int(os.environ.get("PORT", "0"))
-        web_runner = None
-        if port > 0:
-            import aiohttp.web
-            web_app = aiohttp.web.Application()
-            web_app.router.add_get("/", lambda r: aiohttp.web.Response(text="Bot is running!"))
-            web_app.router.add_get("/health", lambda r: aiohttp.web.Response(text="OK"))
-            web_runner = aiohttp.web.AppRunner(web_app)
-            await web_runner.setup()
-            site = aiohttp.web.TCPSite(web_runner, "0.0.0.0", port)
-            await site.start()
-            log.info("[WEB] Health check server listening on port %d", port)
 
         # Wait until shutdown is requested
         await shutdown_event.wait()
@@ -146,6 +208,7 @@ async def run() -> None:
 
 def main() -> None:
     """Entry point for direct execution."""
+    _acquire_pid_lock()  # Fail fast if another instance is already running
     try:
         asyncio.run(run())
     except KeyboardInterrupt:

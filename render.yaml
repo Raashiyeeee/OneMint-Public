@@ -1,0 +1,64 @@
+###############################################################################
+# render.yaml — Render Blueprint (Infrastructure-as-Code)
+#
+# Service: OneMint-Public  (srv-daruog7avr4c7389k83g)
+# URL:     https://onemint-public.onrender.com
+#
+# This file is committed to the repo so Render can read it automatically.
+# Docs: https://render.com/docs/blueprint-spec
+###############################################################################
+
+services:
+  - type: web               # "web" = public HTTPS service (matches your existing setup)
+                            # Required for webhook mode — Telegram POSTs updates to you.
+    name: OneMint-Public
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m app.main
+
+    # ── Instance count ────────────────────────────────────────────────────────
+    # Free plan: always 1. Paid plans: pin to 1 to avoid Telegram Conflict errors
+    # if you ever upgrade and auto-scaling kicks in while still using polling.
+    numInstances: 1
+
+    # ── Compute plan ──────────────────────────────────────────────────────────
+    plan: free              # free / starter / standard / pro
+
+    # ── Health check ──────────────────────────────────────────────────────────
+    # Render pings this endpoint to verify the service is alive.
+    # The /health route is served by the aiohttp webhook server in main.py.
+    healthCheckPath: /health
+
+    # ── Environment variables ─────────────────────────────────────────────────
+    envVars:
+      - key: LOG_LEVEL
+        value: INFO
+
+      - key: TEST_MODE
+        value: false
+
+      - key: DATABASE_URL
+        value: sqlite+aiosqlite:///./data/public_mint_bot.db
+
+      # ── Webhook mode (active) ─────────────────────────────────────────────
+      # Telegram pushes updates to this URL — no polling, no Conflict errors.
+      # WEBHOOK_PORT 10000 is the port Render internally routes to.
+      - key: WEBHOOK_URL
+        value: https://onemint-public.onrender.com
+      - key: WEBHOOK_PORT
+        value: 10000
+
+      # Secret vars — set these in the Render dashboard Environment tab:
+      # TELEGRAM_BOT_TOKEN
+      # TELEGRAM_GROUP_ID
+      # PUBLIC_MINT_TOPIC_ID
+      # OPENSEA_API_KEY
+      # ADMIN_USER_IDS
+
+    # ── Persistent disk (for SQLite database) ────────────────────────────────
+    # Note: disk is not available on the free plan.
+    # Uncomment when upgrading to a paid plan.
+    # disk:
+    #   name: bot-data
+    #   mountPath: /app/data
+    #   sizeGB: 1

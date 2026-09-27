@@ -77,6 +77,20 @@ class Settings(BaseSettings):
         description="Manual ETH/USD price override. If unset, fetched from CoinGecko.",
     )
 
+    # ─── Webhook (cloud deployments) ──────────────────────────────────────────
+    # Leave WEBHOOK_URL unset (or empty) to use long-polling mode (default).
+    # Set WEBHOOK_URL to your public HTTPS URL (e.g. on Render) to enable
+    # webhook mode — Telegram pushes updates to you instead of you polling.
+    # Webhook mode is required when running more than one instance.
+    webhook_url: Optional[str] = Field(
+        default=None,
+        description="Public HTTPS base URL for webhook mode (e.g. https://my-bot.onrender.com). Leave unset for polling.",
+    )
+    webhook_port: int = Field(
+        default=10000,
+        description="Port the aiohttp webhook server listens on (Render exposes 10000 by default).",
+    )
+
     # ─── Operational ──────────────────────────────────────────────────────────
     test_mode: bool = Field(default=False, description="Enable test mode with mock data")
     log_level: str = Field(default="INFO", description="Python logging level")
