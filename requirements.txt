@@ -2,7 +2,7 @@
 # (asyncio is part of the Python standard library — no package needed)
 
 # ─── Telegram bot ─────────────────────────────────────────────────────────────
-python-telegram-bot[job-queue]==21.6
+python-telegram-bot[job-queue,webhooks]==21.6
 
 # ─── HTTP client ──────────────────────────────────────────────────────────────
 aiohttp>=3.10,<4.0
