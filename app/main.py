@@ -146,43 +146,59 @@ async def run() -> None:
 
         webhook_url = (settings.webhook_url or "").rstrip("/")
         web_runner = None
+        port = int(os.environ.get("PORT", str(settings.webhook_port or 10000)))
+
+        import aiohttp.web
+        health_app = aiohttp.web.Application()
+        health_app.router.add_get("/", lambda r: aiohttp.web.Response(text="Bot is running!"))
+        health_app.router.add_get("/health", lambda r: aiohttp.web.Response(text="OK"))
 
         if webhook_url:
-            # ── Webhook mode (Render / any cloud host with public HTTPS) ───────
+            # ── Webhook mode (Render / cloud hosts with public HTTPS) ──────────
             webhook_path = f"/webhook/{settings.telegram_bot_token}"
             full_webhook_url = f"{webhook_url}{webhook_path}"
 
-            await tg_app.updater.start_webhook(
-                listen="0.0.0.0",
-                port=settings.webhook_port,
-                url_path=webhook_path,
-                webhook_url=full_webhook_url,
-                drop_pending_updates=False,
+            async def handle_telegram_webhook(request: aiohttp.web.Request) -> aiohttp.web.Response:
+                try:
+                    data = await request.json()
+                    update = Update.de_json(data, bot)
+                    if update:
+                        await tg_app.update_queue.put(update)
+                    return aiohttp.web.Response(status=200)
+                except Exception as exc:
+                    log.error("[WEBHOOK] Error handling update: %s", exc)
+                    return aiohttp.web.Response(status=500)
+
+            health_app.router.add_post(webhook_path, handle_telegram_webhook)
+
+            # Register webhook with Telegram
+            await bot.set_webhook(
+                url=full_webhook_url,
                 allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=False,
             )
-            log.info("[BOT] Webhook mode active → %s (port %d)", full_webhook_url, settings.webhook_port)
+            log.info("[BOT] Webhook registered with Telegram → %s", full_webhook_url)
 
         else:
-            # ── Polling mode (local dev, Docker, systemd, Render Web Service) ──
+            # ── Polling mode (local dev, Docker, systemd) ──────────────────────
+            try:
+                await bot.delete_webhook(drop_pending_updates=False)
+            except Exception as exc:
+                log.warning("[BOT] Could not delete webhook: %s", exc)
+
             await tg_app.updater.start_polling(
                 drop_pending_updates=False,
                 allowed_updates=Update.ALL_TYPES,
             )
             log.info("[BOT] Polling mode active")
 
-            # Optional standalone health-check endpoint for cloud hosts that
-            # require an HTTP ping but don't provide HTTPS (PORT env var).
-            port = int(os.environ.get("PORT", "0"))
-            if port > 0:
-                import aiohttp.web
-                health_app = aiohttp.web.Application()
-                health_app.router.add_get("/", lambda r: aiohttp.web.Response(text="Bot is running!"))
-                health_app.router.add_get("/health", lambda r: aiohttp.web.Response(text="OK"))
-                web_runner = aiohttp.web.AppRunner(health_app)
-                await web_runner.setup()
-                site = aiohttp.web.TCPSite(web_runner, "0.0.0.0", port)
-                await site.start()
-                log.info("[WEB] Health check server listening on port %d", port)
+        # Start aiohttp server (serves /health for Render and /webhook for Telegram)
+        if port > 0:
+            web_runner = aiohttp.web.AppRunner(health_app)
+            await web_runner.setup()
+            site = aiohttp.web.TCPSite(web_runner, "0.0.0.0", port)
+            await site.start()
+            log.info("[WEB] HTTP server listening on port %d (/health ready)", port)
 
         # Start monitor in background
         monitor_task = asyncio.create_task(monitor.start(), name="monitor")
@@ -202,7 +218,8 @@ async def run() -> None:
         except asyncio.CancelledError:
             pass
 
-        await tg_app.updater.stop()
+        if tg_app.updater and tg_app.updater.running:
+            await tg_app.updater.stop()
         await tg_app.stop()
         log.info("[BOT] Telegram stopped")
 
