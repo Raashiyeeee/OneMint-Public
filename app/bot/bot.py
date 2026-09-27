@@ -55,13 +55,37 @@ BOT_COMMANDS = [
 ]
 
 
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+
+async def _post_init(app: Application) -> None:
+    """Register commands menu with Telegram upon startup."""
+    try:
+        await app.bot.set_my_commands(BOT_COMMANDS)
+        log.info("[BOT] Command menu registered with Telegram (%d commands)", len(BOT_COMMANDS))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[BOT] Could not set bot commands menu: %s", exc)
+
+
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors caused by updates."""
+    log.error("[BOT] Exception while handling an update: %s", context.error, exc_info=context.error)
+
+
 def build_application(token: str) -> Application:
     """
     Build and configure the python-telegram-bot Application.
 
     Registers all command handlers and sets the bot command menu.
     """
-    app = Application.builder().token(token).build()
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(_post_init)
+        .build()
+    )
+
+    app.add_error_handler(_error_handler)
 
     app.add_handler(CommandHandler("start",        cmd_start))
     app.add_handler(CommandHandler("help",         cmd_help))

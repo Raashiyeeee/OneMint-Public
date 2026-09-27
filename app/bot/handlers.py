@@ -62,15 +62,10 @@ def _is_admin(user_id: int, admin_ids: list[int]) -> bool:
 
 
 def _admin_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Return True if the user is authorised.
-
-    When RESTRICT_TO_ADMINS=true:
-      - Non-admins get NO reply at all (silent lockdown)
-
-    When RESTRICT_TO_ADMINS=false (default):
-      - Non-admins get an ⛔ Unauthorised reply
-    """
+    """Return True if the user is authorised."""
     admin_ids: list[int] = context.bot_data.get("admin_ids", [])
+    if not update.effective_user:
+        return False
     if admin_ids and update.effective_user.id not in admin_ids:
         return False
     return True
@@ -78,10 +73,21 @@ def _admin_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 def _should_reply_unauthorized(context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Return True if the bot should send an ⛔ reply to non-admins.
-    When RESTRICT_TO_ADMINS=true, stay silent instead."""
+    When RESTRICT_TO_ADMINS=true, stay silent for admin-only commands."""
     settings = context.bot_data.get("settings")
     restrict = getattr(settings, "restrict_to_admins", False) if settings else False
     return not restrict  # reply only when NOT in lockdown mode
+
+
+async def _reject_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send an unauthorized notice if configured to do so."""
+    if _should_reply_unauthorized(context) and update.effective_message:
+        user_id = update.effective_user.id if update.effective_user else "unknown"
+        await update.effective_message.reply_text(
+            f"⛔ <b>Unauthorised</b>\nYour Telegram User ID is: <code>{user_id}</code>.\n"
+            "This command is restricted to administrators.",
+            parse_mode="HTML",
+        )
 
 
 def _is_super_admin(user_id: int, admin_ids: list[int]) -> bool:
@@ -122,70 +128,104 @@ async def _load_runtime_admin_ids() -> list[int]:
 # ── /start ─────────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /start.
-    Silently ignored for non-admins when RESTRICT_TO_ADMINS=true.
-    """
-    if not _admin_check(update, context) and not _should_reply_unauthorized(context):
-        return  # Silent lockdown
-    await update.message.reply_text(
-        "👋 <b>Public Mint Link Bot</b> is running.\n\n"
+    """Handle /start. Always greet the user and display status / user ID."""
+    if not update.effective_message:
+        return
+    user_id = update.effective_user.id if update.effective_user else "unknown"
+    is_admin = _admin_check(update, context)
+
+    if is_admin:
+        role_badge = f"✅ <b>Authorised Admin</b> (User ID: <code>{user_id}</code>)"
+        help_tip = "Use /help to see all available commands, or /status to check health."
+    else:
+        role_badge = (
+            f"ℹ️ <b>Your Telegram User ID:</b> <code>{user_id}</code>\n"
+            f"⚠️ <i>Administrative commands are restricted to authorised admins. "
+            f"To grant admin access, add this ID (<code>{user_id}</code>) to <code>ADMIN_USER_IDS</code>.</i>"
+        )
+        help_tip = "Use /ping to check bot connectivity."
+
+    text = (
+        "👋 <b>Public Mint Link Bot</b> is online!\n\n"
+        f"{role_badge}\n\n"
         "I monitor OpenSea for qualifying public NFT mints across 15 chains "
-        "and post alerts to the <b>Public mint links</b> topic — 10 minutes before each mint starts.\n\n"
-        "Use /help to see all available commands.",
-        parse_mode="HTML",
+        "and post alerts to configured broadcast destinations — 10 minutes before each mint starts.\n\n"
+        f"{help_tip}"
     )
+    await update.effective_message.reply_text(text, parse_mode="HTML")
 
 
 # ── /help ──────────────────────────────────────────────────────────────────────
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /help.
-    Silently ignored for non-admins when RESTRICT_TO_ADMINS=true.
-    """
-    if not _admin_check(update, context) and not _should_reply_unauthorized(context):
-        return  # Silent lockdown
+    """Handle /help. Shows commands available to the user."""
+    if not update.effective_message:
+        return
+    is_admin = _admin_check(update, context)
+
     lines = [
         "📖 <b>Public Mint Link Bot — Commands</b>",
         "",
         "<b>General</b>",
-        "/start — Welcome message",
+        "/start — Welcome message and user info",
         "/help  — This help message",
         "/ping  — Check if bot is alive",
-        "",
-        "<b>Monitoring (Admin)</b>",
-        "/status  — Bot health and live metrics",
-        "/monitor on|off — Enable or pause monitoring",
-        "/jobs    — Show all pending scheduled jobs",
-        "",
-        "<b>Data (Admin)</b>",
-        "/stats   — Today's mint discovery stats",
-        "/recent  — Last 5 qualified mints",
-        "/chains  — All chains and their API status",
-        "",
-        "<b>Configuration (Admin)</b>",
-        "/filters — Show current filter settings",
-        "/setfilter &lt;key&gt; &lt;value&gt; — Change a filter value",
-        "/setinterval &lt;time&gt; — Change fetch interval (e.g. 30m, 1h)",
-        "",
-        "<b>Testing & Destinations (Admin)</b>",
-        "/targets   — List all broadcast groups/channels",
-        "/addtarget &lt;chat_id&gt; [topic_id] [label] — Add destination",
-        "/removetarget &lt;chat_id&gt; [topic_id] — Remove destination",
-        "/test — Send a mock alert to all targets",
     ]
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    if is_admin:
+        lines.extend([
+            "",
+            "<b>Monitoring (Admin)</b>",
+            "/status  — Bot health and live metrics",
+            "/monitor on|off — Enable or pause monitoring",
+            "/jobs    — Show all pending scheduled jobs",
+            "",
+            "<b>Data (Admin)</b>",
+            "/stats   — Today's mint discovery stats",
+            "/recent  — Last 5 qualified mints",
+            "/chains  — All chains and their API status",
+            "",
+            "<b>Configuration (Admin)</b>",
+            "/filters — Show current filter settings",
+            "/setfilter &lt;key&gt; &lt;value&gt; — Change a filter value",
+            "/setinterval &lt;time&gt; — Change fetch interval (e.g. 30m, 1h)",
+            "",
+            "<b>Testing & Destinations (Admin)</b>",
+            "/targets   — List all broadcast groups/channels",
+            "/addtarget &lt;chat_id&gt; [topic_id] [label] — Add destination",
+            "/removetarget &lt;chat_id&gt; [topic_id] — Remove destination",
+            "/test — Send a mock alert to all targets",
+            "",
+            "<b>Admins (Super-Admin)</b>",
+            "/admins       — List all current admins",
+            "/addadmin     — Add a new admin by user ID",
+            "/removeadmin  — Remove an admin by user ID",
+        ])
+    else:
+        user_id = update.effective_user.id if update.effective_user else "unknown"
+        lines.extend([
+            "",
+            f"🔒 <i>Note: Administrative commands are restricted. Your User ID is <code>{user_id}</code>.</i>",
+        ])
+
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 # ── /ping ──────────────────────────────────────────────────────────────────────
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /ping — quick liveness check (admin only)."""
-    if not _admin_check(update, context):
-        if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+    """Handle /ping — quick liveness check for everyone."""
+    if not update.effective_message:
         return
     import datetime
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    await update.message.reply_text(f"🏓 Pong! Bot is alive.\n<code>{now}</code>", parse_mode="HTML")
+    user_id = update.effective_user.id if update.effective_user else "unknown"
+    is_admin = _admin_check(update, context)
+    badge = " (Admin)" if is_admin else f" (User ID: <code>{user_id}</code>)"
+    await update.effective_message.reply_text(
+        f"🏓 Pong! Bot is alive{badge}.\n<code>{now}</code>",
+        parse_mode="HTML",
+    )
 
 
 # ── /status ────────────────────────────────────────────────────────────────────
@@ -193,7 +233,7 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /status — admin only."""
     if not _admin_check(update, context):
-        if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+        await _reject_unauthorized(update, context)
         return
 
     monitor: MintMonitor | None = context.bot_data.get("monitor")
@@ -253,7 +293,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Auto-Deleted:   {health.get('deletions', 0)}",
         f"Failed Ops:     {health.get('failed_ops', 0)}",
     ]
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await (update.effective_message or update.message).reply_text("\n".join(lines), parse_mode="HTML")
 
 
 # ── /monitor ───────────────────────────────────────────────────────────────────
@@ -261,25 +301,25 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /monitor on|off — admin only."""
     if not _admin_check(update, context):
-        if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+        await _reject_unauthorized(update, context)
         return
 
     args = context.args
     if not args or args[0].lower() not in ("on", "off"):
-        await update.message.reply_text("Usage: /monitor on | /monitor off")
+        await (update.effective_message or update.message).reply_text("Usage: /monitor on | /monitor off")
         return
 
     monitor: MintMonitor | None = context.bot_data.get("monitor")
     if monitor is None:
-        await update.message.reply_text("❌ Monitor not initialised.")
+        await (update.effective_message or update.message).reply_text("❌ Monitor not initialised.")
         return
 
     action = args[0].lower()
     monitor.set_enabled(action == "on")
     if action == "on":
-        await update.message.reply_text("✅ Monitoring <b>enabled</b> — polling resumed.", parse_mode="HTML")
+        await (update.effective_message or update.message).reply_text("✅ Monitoring <b>enabled</b> — polling resumed.", parse_mode="HTML")
     else:
-        await update.message.reply_text("⏸ Monitoring <b>paused</b> — no alerts will be sent until re-enabled.", parse_mode="HTML")
+        await (update.effective_message or update.message).reply_text("⏸ Monitoring <b>paused</b> — no alerts will be sent until re-enabled.", parse_mode="HTML")
 
 
 # ── /chains ────────────────────────────────────────────────────────────────────
@@ -287,7 +327,7 @@ async def cmd_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def cmd_chains(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /chains — show all 15 chains and their support status (admin only)."""
     if not _admin_check(update, context):
-        if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+        await _reject_unauthorized(update, context)
         return
 
     from app.chains.registry import CHAINS
@@ -298,7 +338,7 @@ async def cmd_chains(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         lines.append(f"{icon} <b>{chain.name}</b> — <code>{api_id}</code>")
 
     lines += ["", "⚠️ = Not in OpenSea API (skipped during polling)"]
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await (update.effective_message or update.message).reply_text("\n".join(lines), parse_mode="HTML")
 
 
 # ── /filters ───────────────────────────────────────────────────────────────────
@@ -306,12 +346,12 @@ async def cmd_chains(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /filters — show current filter values (admin only)."""
     if not _admin_check(update, context):
-        if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+        await _reject_unauthorized(update, context)
         return
 
     settings = context.bot_data.get("settings")
     if not settings:
-        await update.message.reply_text("❌ Settings not available.")
+        await (update.effective_message or update.message).reply_text("❌ Settings not available.")
         return
 
     interval_s = settings.poll_interval_seconds
@@ -337,7 +377,7 @@ async def cmd_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "        <code>free_mint_min_offer_usd</code>, <code>min_minted_percentage</code>,",
         "        <code>allow_sold_out</code>, <code>delete_after_minutes</code>",
     ]
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await (update.effective_message or update.message).reply_text("\n".join(lines), parse_mode="HTML")
 
 
 def _persist_to_env(env_var: str, value: str) -> bool:
@@ -377,12 +417,12 @@ async def cmd_setfilter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
       /setfilter max_mint_price_usd 15
     """
     if not _admin_check(update, context):
-        if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+        await _reject_unauthorized(update, context)
         return
 
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text(
+        await (update.effective_message or update.message).reply_text(
             "Usage: /setfilter &lt;key&gt; &lt;value&gt;\n\n"
             "Valid keys:\n" +
             "\n".join(f"• <code>{k}</code> — {v[1]}" for k, v in FILTER_FIELDS.items()),
@@ -394,7 +434,7 @@ async def cmd_setfilter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     raw_value = args[1]
 
     if key not in FILTER_FIELDS:
-        await update.message.reply_text(
+        await (update.effective_message or update.message).reply_text(
             f"❌ Unknown key: <code>{key}</code>\n"
             f"Valid keys: {', '.join(f'<code>{k}</code>' for k in FILTER_FIELDS)}",
             parse_mode="HTML",
@@ -411,7 +451,7 @@ async def cmd_setfilter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             if key in ("delete_after_minutes", "notification_before_minutes") and value < 0:
                 raise ValueError("Must be non-negative")
         except ValueError as exc:
-            await update.message.reply_text(f"❌ Invalid value: {exc}")
+            await (update.effective_message or update.message).reply_text(f"❌ Invalid value: {exc}")
             return
     else:
         try:
@@ -419,7 +459,7 @@ async def cmd_setfilter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             if value < 0:
                 raise ValueError("Value must be non-negative")
         except (InvalidOperation, ValueError) as exc:
-            await update.message.reply_text(f"❌ Invalid value: {exc}")
+            await (update.effective_message or update.message).reply_text(f"❌ Invalid value: {exc}")
             return
 
     settings = context.bot_data.get("settings")
@@ -428,14 +468,14 @@ async def cmd_setfilter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         env_var = FILTER_FIELDS[key][0]
         saved_env = _persist_to_env(env_var, str(value))
         note = "✅ Saved to .env — will persist across restarts." if saved_env else "⚡ Live updated for current session."
-        await update.message.reply_text(
+        await (update.effective_message or update.message).reply_text(
             f"✅ Updated <code>{key}</code> = <b>{value}</b>\n"
             f"<i>{note}</i>",
             parse_mode="HTML",
         )
         log.info("[CONFIG] Runtime filter change: %s = %s by user %s (saved_to_env=%s)", key, value, update.effective_user.id, saved_env)
     else:
-        await update.message.reply_text("❌ Settings not available.")
+        await (update.effective_message or update.message).reply_text("❌ Settings not available.")
 
 
 # ── /setinterval ───────────────────────────────────────────────────────────────
@@ -451,12 +491,12 @@ async def cmd_setinterval(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
       /setinterval 1800  — seconds directly
     """
     if not _admin_check(update, context):
-        if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+        await _reject_unauthorized(update, context)
         return
 
     settings = context.bot_data.get("settings")
     if not settings:
-        await update.message.reply_text("❌ Settings not available.")
+        await (update.effective_message or update.message).reply_text("❌ Settings not available.")
         return
 
     args = context.args
@@ -464,7 +504,7 @@ async def cmd_setinterval(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         interval_s = settings.poll_interval_seconds
         interval_m = interval_s / 60
         curr_str = f"{interval_m:.1f}m ({interval_s}s)" if interval_m >= 1 else f"{interval_s}s"
-        await update.message.reply_text(
+        await (update.effective_message or update.message).reply_text(
             f"⏱ Current Fetch Interval: <b>{curr_str}</b>\n\n"
             "<b>Usage:</b> <code>/setinterval &lt;time&gt;</code>\n\n"
             "<b>Examples:</b>\n"
@@ -487,11 +527,11 @@ async def cmd_setinterval(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             seconds = int(raw)
     except (ValueError, TypeError):
-        await update.message.reply_text("❌ Invalid format. Examples: <code>30m</code>, <code>1h</code>, <code>45s</code>, <code>1800</code>", parse_mode="HTML")
+        await (update.effective_message or update.message).reply_text("❌ Invalid format. Examples: <code>30m</code>, <code>1h</code>, <code>45s</code>, <code>1800</code>", parse_mode="HTML")
         return
 
     if not (30 <= seconds <= 86400):
-        await update.message.reply_text("❌ Interval must be between 30 seconds and 86400 seconds (24 hours).")
+        await (update.effective_message or update.message).reply_text("❌ Interval must be between 30 seconds and 86400 seconds (24 hours).")
         return
 
     settings.poll_interval_seconds = seconds
@@ -500,7 +540,7 @@ async def cmd_setinterval(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     mins = seconds / 60
     time_str = f"{mins:.1f} minutes ({seconds}s)" if mins >= 1 else f"{seconds} seconds"
-    await update.message.reply_text(
+    await (update.effective_message or update.message).reply_text(
         f"⏱ Fetch interval updated to <b>{time_str}</b>\n"
         f"<i>{note}</i>",
         parse_mode="HTML",
@@ -513,7 +553,7 @@ async def cmd_setinterval(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /stats — today's discovery stats from the database (admin only)."""
     if not _admin_check(update, context):
-        if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+        await _reject_unauthorized(update, context)
         return
 
     try:
@@ -551,11 +591,11 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"⏰ Expired:     <b>{stats.get('EXPIRED', 0)}</b>",
             f"⚠️ Failed:      <b>{stats.get('FAILED', 0)}</b>",
         ]
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        await (update.effective_message or update.message).reply_text("\n".join(lines), parse_mode="HTML")
 
     except Exception as exc:
         log.error("[BOT] cmd_stats error: %s", exc)
-        await update.message.reply_text(f"❌ Error fetching stats: {exc}")
+        await (update.effective_message or update.message).reply_text(f"❌ Error fetching stats: {exc}")
 
 
 # ── /recent ────────────────────────────────────────────────────────────────────
@@ -563,7 +603,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /recent — show last 5 qualified mints (admin only)."""
     if not _admin_check(update, context):
-        if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+        await _reject_unauthorized(update, context)
         return
 
     try:
@@ -582,7 +622,7 @@ async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             records = list(result.scalars().all())
 
         if not records:
-            await update.message.reply_text("📭 No qualified mints found yet.")
+            await (update.effective_message or update.message).reply_text("📭 No qualified mints found yet.")
             return
 
         lines = ["🕐 <b>Last 5 Qualified Mints</b>", ""]
@@ -598,11 +638,11 @@ async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 f"   Status: <code>{r.status}</code>"
             )
 
-        await update.message.reply_text("\n\n".join(lines), parse_mode="HTML")
+        await (update.effective_message or update.message).reply_text("\n\n".join(lines), parse_mode="HTML")
 
     except Exception as exc:
         log.error("[BOT] cmd_recent error: %s", exc)
-        await update.message.reply_text(f"❌ Error: {exc}")
+        await (update.effective_message or update.message).reply_text(f"❌ Error: {exc}")
 
 
 # ── /jobs ──────────────────────────────────────────────────────────────────────
@@ -610,17 +650,17 @@ async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /jobs — show all pending APScheduler jobs (admin only)."""
     if not _admin_check(update, context):
-        if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+        await _reject_unauthorized(update, context)
         return
 
     monitor: MintMonitor | None = context.bot_data.get("monitor")
     if monitor is None:
-        await update.message.reply_text("❌ Monitor not initialised.")
+        await (update.effective_message or update.message).reply_text("❌ Monitor not initialised.")
         return
 
     jobs = monitor._scheduler.list_jobs()
     if not jobs:
-        await update.message.reply_text("📭 No pending scheduled jobs.")
+        await (update.effective_message or update.message).reply_text("📭 No pending scheduled jobs.")
         return
 
     lines = [f"⏰ <b>Pending Jobs ({len(jobs)})</b>", ""]
@@ -633,7 +673,7 @@ async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(jobs) > 15:
         lines.append(f"\n<i>…and {len(jobs) - 15} more</i>")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await (update.effective_message or update.message).reply_text("\n".join(lines), parse_mode="HTML")
 
 
 # ── /test ──────────────────────────────────────────────────────────────────────
@@ -643,7 +683,7 @@ async def cmd_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_targets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /targets — list all broadcast destination groups/channels/topics (admin only)."""
     if not _admin_check(update, context):
-        if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+        await _reject_unauthorized(update, context)
         return
 
     settings = context.bot_data.get("settings")
@@ -680,7 +720,7 @@ async def cmd_targets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "• <code>/removetarget &lt;chat_id&gt; [topic_id]</code>",
         "• <code>/test</code> — sends a test alert to all targets",
     ]
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await (update.effective_message or update.message).reply_text("\n".join(lines), parse_mode="HTML")
 
 
 # ── /addtarget ─────────────────────────────────────────────────────────────────
@@ -691,12 +731,12 @@ async def cmd_addtarget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     Adds a new destination group or channel.
     """
     if not _admin_check(update, context):
-        if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+        await _reject_unauthorized(update, context)
         return
 
     args = context.args
     if not args:
-        await update.message.reply_text(
+        await (update.effective_message or update.message).reply_text(
             "<b>Usage:</b>\n"
             "<code>/addtarget &lt;chat_id&gt; [topic_id] [label]</code>\n\n"
             "<b>Examples:</b>\n"
@@ -711,7 +751,7 @@ async def cmd_addtarget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     try:
         chat_id = int(args[0])
     except ValueError:
-        await update.message.reply_text("❌ Invalid chat_id. It must be an integer (e.g. <code>-1001234567890</code>).", parse_mode="HTML")
+        await (update.effective_message or update.message).reply_text("❌ Invalid chat_id. It must be an integer (e.g. <code>-1001234567890</code>).", parse_mode="HTML")
         return
 
     topic_id: Optional[int] = None
@@ -739,7 +779,7 @@ async def cmd_addtarget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     topic_desc = f"<code>{topic_id}</code>" if topic_id else "<i>General / Channel (No topic)</i>"
     label_desc = f"<b>{label}</b>" if label else "<i>None</i>"
 
-    await update.message.reply_text(
+    await (update.effective_message or update.message).reply_text(
         "✅ <b>Broadcast target added!</b>\n\n"
         f"• <b>Chat ID:</b> <code>{chat_id}</code>\n"
         f"• <b>Topic ID:</b> {topic_desc}\n"
@@ -758,12 +798,12 @@ async def cmd_removetarget(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     Handle /removetarget <chat_id> [topic_id] (admin only).
     """
     if not _admin_check(update, context):
-        if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+        await _reject_unauthorized(update, context)
         return
 
     args = context.args
     if not args:
-        await update.message.reply_text(
+        await (update.effective_message or update.message).reply_text(
             "<b>Usage:</b>\n"
             "<code>/removetarget &lt;chat_id&gt; [topic_id]</code>\n\n"
             "Run <code>/targets</code> to see active targets.",
@@ -774,7 +814,7 @@ async def cmd_removetarget(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try:
         chat_id = int(args[0])
     except ValueError:
-        await update.message.reply_text("❌ Invalid chat_id. It must be an integer.", parse_mode="HTML")
+        await (update.effective_message or update.message).reply_text("❌ Invalid chat_id. It must be an integer.", parse_mode="HTML")
         return
 
     topic_id: Optional[int] = None
@@ -794,13 +834,13 @@ async def cmd_removetarget(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await session.commit()
 
     if removed:
-        await update.message.reply_text(
+        await (update.effective_message or update.message).reply_text(
             f"✅ Removed target <code>{chat_id}</code> (topic: <code>{topic_id or 'General'}</code>).",
             parse_mode="HTML",
         )
         log.info("[TARGET_CONFIG] Target removed chat_id=%d topic_id=%s by user %s", chat_id, topic_id, update.effective_user.id)
     else:
-        await update.message.reply_text(
+        await (update.effective_message or update.message).reply_text(
             f"⚠️ Target <code>{chat_id}</code> (topic: <code>{topic_id or 'General'}</code>) was not found in additional targets list.",
             parse_mode="HTML",
         )
@@ -811,12 +851,12 @@ async def cmd_removetarget(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /test — send a mock alert to all broadcast targets (admin only)."""
     if not _admin_check(update, context):
-        if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+        await _reject_unauthorized(update, context)
         return
 
     settings = context.bot_data.get("settings")
     if not settings:
-        await update.message.reply_text("❌ Settings not available.")
+        await (update.effective_message or update.message).reply_text("❌ Settings not available.")
         return
 
     test_text = (
@@ -869,7 +909,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🧪 <b>Test Alert Broadcast Results</b>",
         "",
     ] + results
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await (update.effective_message or update.message).reply_text("\n".join(lines), parse_mode="HTML")
 
 
 # ── /admins ────────────────────────────────────────────────────────────────────
@@ -877,12 +917,12 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /admins — list all current admins (admin only)."""
     if not _admin_check(update, context):
-        if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+        await _reject_unauthorized(update, context)
         return
 
     admin_ids: list[int] = context.bot_data.get("admin_ids", [])
     if not admin_ids:
-        await update.message.reply_text("ℹ️ No admin restriction set — all users can use admin commands.")
+        await (update.effective_message or update.message).reply_text("ℹ️ No admin restriction set — all users can use admin commands.")
         return
 
     lines = ["👑 <b>Current Admins</b>", ""]
@@ -896,7 +936,7 @@ async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "/addadmin &lt;user_id&gt;",
         "/removeadmin &lt;user_id&gt;",
     ]
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    await (update.effective_message or update.message).reply_text("\n".join(lines), parse_mode="HTML")
 
 
 # ── /addadmin ──────────────────────────────────────────────────────────────────
@@ -917,9 +957,9 @@ async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Only the super-admin (first in list) can add new admins
     if not _is_super_admin(user_id, admin_ids):
         if not _admin_check(update, context):
-            if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+            await _reject_unauthorized(update, context)
         else:
-            await update.message.reply_text(
+            await (update.effective_message or update.message).reply_text(
                 "⛔ Only the <b>super-admin</b> can add new admins.\n"
                 f"Super-admin ID: <code>{admin_ids[0] if admin_ids else 'none'}</code>",
                 parse_mode="HTML",
@@ -928,7 +968,7 @@ async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     args = context.args
     if not args:
-        await update.message.reply_text(
+        await (update.effective_message or update.message).reply_text(
             "Usage: /addadmin &lt;user_id&gt;\n\n"
             "To get someone's user ID, ask them to message @userinfobot.",
             parse_mode="HTML",
@@ -938,11 +978,11 @@ async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         new_id = int(args[0])
     except ValueError:
-        await update.message.reply_text("❌ Invalid user ID — must be a number.\nExample: /addadmin 987654321")
+        await (update.effective_message or update.message).reply_text("❌ Invalid user ID — must be a number.\nExample: /addadmin 987654321")
         return
 
     if new_id in admin_ids:
-        await update.message.reply_text(f"ℹ️ User <code>{new_id}</code> is already an admin.", parse_mode="HTML")
+        await (update.effective_message or update.message).reply_text(f"ℹ️ User <code>{new_id}</code> is already an admin.", parse_mode="HTML")
         return
 
     admin_ids.append(new_id)
@@ -950,7 +990,7 @@ async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await _persist_admin_ids(context, admin_ids)
 
     log.info("[ADMIN] Super-admin %d added new admin: %d", user_id, new_id)
-    await update.message.reply_text(
+    await (update.effective_message or update.message).reply_text(
         f"✅ <code>{new_id}</code> has been added as an admin.\n\n"
         f"They now have access to all admin commands.\n"
         f"Total admins: <b>{len(admin_ids)}</b>",
@@ -974,9 +1014,9 @@ async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if not _is_super_admin(user_id, admin_ids):
         if not _admin_check(update, context):
-            if _should_reply_unauthorized(context): await update.message.reply_text("⛔ Unauthorised.")
+            await _reject_unauthorized(update, context)
         else:
-            await update.message.reply_text(
+            await (update.effective_message or update.message).reply_text(
                 "⛔ Only the <b>super-admin</b> can remove admins.",
                 parse_mode="HTML",
             )
@@ -984,17 +1024,17 @@ async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     args = context.args
     if not args:
-        await update.message.reply_text("Usage: /removeadmin &lt;user_id&gt;", parse_mode="HTML")
+        await (update.effective_message or update.message).reply_text("Usage: /removeadmin &lt;user_id&gt;", parse_mode="HTML")
         return
 
     try:
         target_id = int(args[0])
     except ValueError:
-        await update.message.reply_text("❌ Invalid user ID — must be a number.")
+        await (update.effective_message or update.message).reply_text("❌ Invalid user ID — must be a number.")
         return
 
     if target_id == admin_ids[0]:
-        await update.message.reply_text(
+        await (update.effective_message or update.message).reply_text(
             "⛔ You cannot remove yourself (super-admin).\n"
             "Transfer super-admin role first by editing <code>ADMIN_USER_IDS</code> in .env.",
             parse_mode="HTML",
@@ -1002,7 +1042,7 @@ async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if target_id not in admin_ids:
-        await update.message.reply_text(f"ℹ️ <code>{target_id}</code> is not an admin.", parse_mode="HTML")
+        await (update.effective_message or update.message).reply_text(f"ℹ️ <code>{target_id}</code> is not an admin.", parse_mode="HTML")
         return
 
     admin_ids.remove(target_id)
@@ -1010,7 +1050,7 @@ async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _persist_admin_ids(context, admin_ids)
 
     log.info("[ADMIN] Super-admin %d removed admin: %d", user_id, target_id)
-    await update.message.reply_text(
+    await (update.effective_message or update.message).reply_text(
         f"✅ <code>{target_id}</code> has been removed from admins.\n"
         f"Remaining admins: <b>{len(admin_ids)}</b>",
         parse_mode="HTML",

@@ -117,10 +117,17 @@ async def run() -> None:
         notifier=notifier,
     )
 
+    # Load runtime admin IDs from database and merge with configured admin IDs
+    from app.bot.handlers import _load_runtime_admin_ids
+    from telegram import Update
+
+    runtime_admins = await _load_runtime_admin_ids()
+    merged_admin_ids = list(dict.fromkeys(settings.admin_ids + runtime_admins))
+
     # Inject shared state into bot context
     tg_app.bot_data["settings"] = settings
     tg_app.bot_data["monitor"] = monitor
-    tg_app.bot_data["admin_ids"] = settings.admin_ids
+    tg_app.bot_data["admin_ids"] = merged_admin_ids
 
     # ── Graceful shutdown handler ─────────────────────────────────────────────
     shutdown_event = asyncio.Event()
@@ -142,11 +149,6 @@ async def run() -> None:
 
         if webhook_url:
             # ── Webhook mode (Render / any cloud host with public HTTPS) ───────
-            # Telegram pushes updates to us — no polling loop, no Conflict errors,
-            # and it works safely even if the service briefly restarts during deploy.
-            #
-            # The bot token is embedded in the path as a secret suffix so the
-            # endpoint is not guessable by outsiders.
             webhook_path = f"/webhook/{settings.telegram_bot_token}"
             full_webhook_url = f"{webhook_url}{webhook_path}"
 
@@ -155,14 +157,17 @@ async def run() -> None:
                 port=settings.webhook_port,
                 url_path=webhook_path,
                 webhook_url=full_webhook_url,
-                drop_pending_updates=True,
-                allowed_updates=["message", "callback_query"],
+                drop_pending_updates=False,
+                allowed_updates=Update.ALL_TYPES,
             )
             log.info("[BOT] Webhook mode active → %s (port %d)", full_webhook_url, settings.webhook_port)
 
         else:
-            # ── Polling mode (local dev, Docker, systemd) ──────────────────────
-            await tg_app.updater.start_polling(drop_pending_updates=True)
+            # ── Polling mode (local dev, Docker, systemd, Render Web Service) ──
+            await tg_app.updater.start_polling(
+                drop_pending_updates=False,
+                allowed_updates=Update.ALL_TYPES,
+            )
             log.info("[BOT] Polling mode active")
 
             # Optional standalone health-check endpoint for cloud hosts that
