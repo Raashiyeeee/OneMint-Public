@@ -29,6 +29,7 @@ Super-admin:
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -430,12 +431,13 @@ async def cmd_setfilter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    key = args[0].lower()
-    raw_value = args[1]
+    key = args[0].strip("<>").strip().lower()
+    raw_value = args[1].strip("<>").strip()
 
     if key not in FILTER_FIELDS:
+        safe_key = html.escape(key)
         await (update.effective_message or update.message).reply_text(
-            f"❌ Unknown key: <code>{key}</code>\n"
+            f"❌ Unknown key: <code>{safe_key}</code>\n"
             f"Valid keys: {', '.join(f'<code>{k}</code>' for k in FILTER_FIELDS)}",
             parse_mode="HTML",
         )
@@ -516,7 +518,7 @@ async def cmd_setinterval(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    raw = args[0].strip().lower()
+    raw = args[0].strip("<>").strip().lower()
     try:
         if raw.endswith("h"):
             seconds = int(float(raw[:-1]) * 3600)
@@ -777,7 +779,7 @@ async def cmd_addtarget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await session.commit()
 
     topic_desc = f"<code>{topic_id}</code>" if topic_id else "<i>General / Channel (No topic)</i>"
-    label_desc = f"<b>{label}</b>" if label else "<i>None</i>"
+    label_desc = f"<b>{html.escape(label)}</b>" if label else "<i>None</i>"
 
     await (update.effective_message or update.message).reply_text(
         "✅ <b>Broadcast target added!</b>\n\n"
