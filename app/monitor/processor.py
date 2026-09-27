@@ -104,10 +104,15 @@ class MintProcessor:
         if floor_stats and floor_stats.floor_price is not None:
             floor_price_usd = float(self._eth_price_usd) * floor_stats.floor_price
 
-        # Use detailed supply if available
+        # Use detailed supply if available.
+        # NOTE: Use explicit `is not None` — the `or` operator would treat 0 as
+        # falsy and silently fall back to the list value, breaking minted_percentage
+        # for new drops that have 0 tokens minted so far.
         if detailed:
-            raw.total_supply = detailed.total_supply or raw.total_supply
-            raw.max_supply = detailed.max_supply or raw.max_supply
+            if detailed.total_supply is not None:
+                raw.total_supply = detailed.total_supply
+            if detailed.max_supply is not None:
+                raw.max_supply = detailed.max_supply
 
         # ── Step 3: Normalise ─────────────────────────────────────────────────
         try:
