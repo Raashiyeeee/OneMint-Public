@@ -85,6 +85,8 @@ class MintProcessor:
                 free_mint_min_offer_usd=settings.free_mint_min_offer_usd,
                 min_minted_percentage=settings.min_minted_percentage,
                 allow_sold_out=settings.allow_sold_out,
+                allow_missing_offer=settings.allow_missing_offer,
+                allow_missing_supply=settings.allow_missing_supply,
             )
         )
 

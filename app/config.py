@@ -62,6 +62,17 @@ class Settings(BaseSettings):
     min_minted_percentage: Decimal = Field(default=Decimal("70"), description="Minimum minted percentage required")
     allow_sold_out: bool = Field(default=False, description="Allow 100% sold-out mints")
     duplicate_listings: bool = Field(default=False, description="Allow duplicate listings")
+    # When True, mints with no floor/offer price from the API pass through with a
+    # warning instead of being hard-rejected (prevents silent drops like Robinhood NFTs)
+    allow_missing_offer: bool = Field(
+        default=True,
+        description="Pass mints through when floor/offer price is unavailable from API",
+    )
+    # When True, mints with no supply data from the API pass through with a warning
+    allow_missing_supply: bool = Field(
+        default=True,
+        description="Pass mints through when minted supply data is unavailable from API",
+    )
 
     # ─── Scheduling ────────────────────────────────────────────────────────────
     notification_before_minutes: int = Field(
