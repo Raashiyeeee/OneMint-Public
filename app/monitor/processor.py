@@ -99,12 +99,13 @@ class MintProcessor:
         if not _validate_raw(raw, stage):
             return  # [INVALID_DATA] already logged inside
 
-        # ── Step 2: Fetch supply and floor price ──────────────────────────────
+        # ── Step 2: Fetch supply and offer price ──────────────────────────────
         detailed = await self._provider.get_mint_details(raw.collection_slug)
-        floor_stats = await self._provider.get_collection_floor_price(raw.collection_slug)
-        floor_price_usd: Optional[float] = None
-        if floor_stats and floor_stats.floor_price is not None:
-            floor_price_usd = float(self._eth_price_usd) * floor_stats.floor_price
+        offer_price_usd = await self._provider.get_collection_offer_price(
+            raw.collection_slug,
+            chain=raw.chain,
+            contract_address=raw.contract_address,
+        )
 
         # Use detailed supply if available.
         # NOTE: Use explicit `is not None` — the `or` operator would treat 0 as
@@ -119,7 +120,7 @@ class MintProcessor:
         # ── Step 3: Normalise ─────────────────────────────────────────────────
         try:
             mint = await self._provider.normalize_mint(
-                raw, stage, float(self._eth_price_usd), floor_price_usd
+                raw, stage, float(self._eth_price_usd), offer_price_usd=offer_price_usd
             )
         except Exception as exc:
             log.warning(

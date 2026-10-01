@@ -158,3 +158,73 @@ async def test_normalize_mint_timestamp_utc():
 
     assert mint.mint_start_time.tzinfo is not None
     await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_normalize_mint_with_offer_price_usd():
+    """normalize_mint accepts offer_price_usd parameter directly."""
+    provider = OpenSeaProvider(api_key="test-key-not-used")
+    stage = make_stage()
+    raw = make_raw_drop()
+
+    mint = await provider.normalize_mint(
+        raw, stage, eth_price_usd=2000.0, offer_price_usd=42.50
+    )
+
+    assert mint.offer_price_usd == Decimal("42.50")
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_get_collection_offer_price_calculation(monkeypatch):
+    """get_collection_offer_price selects highest active non-expired offer and converts to USD."""
+    provider = OpenSeaProvider(api_key="test-key-not-used")
+
+    mock_resp = {
+        "offers": [
+            {
+                "status": "ACTIVE",
+                "price": {"currency": "WETH", "decimals": 18, "value": "1000000000000000"},  # 0.001 ETH
+                "protocol_data": {"parameters": {"endTime": "9999999999"}},
+            },
+            {
+                "status": "ACTIVE",
+                "price": {"currency": "WETH", "decimals": 18, "value": "2000000000000000"},  # 0.002 ETH (highest)
+                "protocol_data": {"parameters": {"endTime": "9999999999"}},
+            },
+            {
+                "status": "EXPIRED",
+                "price": {"currency": "WETH", "decimals": 18, "value": "5000000000000000"},  # 0.005 ETH but expired status
+                "protocol_data": {"parameters": {"endTime": "9999999999"}},
+            },
+        ]
+    }
+
+    async def mock_get(url, params=None):
+        return mock_resp
+
+    async def mock_eth():
+        return Decimal("3000")
+
+    monkeypatch.setattr(provider, "_get", mock_get)
+    monkeypatch.setattr(provider, "get_eth_price_usd", mock_eth)
+
+    # 0.002 ETH * 3000 = $6.00
+    offer_usd = await provider.get_collection_offer_price("test-collection")
+    assert offer_usd == 6.00
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_get_collection_offer_price_empty(monkeypatch):
+    """get_collection_offer_price returns None when no offers exist."""
+    provider = OpenSeaProvider(api_key="test-key-not-used")
+
+    async def mock_get(url, params=None):
+        return {"offers": []}
+
+    monkeypatch.setattr(provider, "_get", mock_get)
+
+    offer_usd = await provider.get_collection_offer_price("no-offers-slug")
+    assert offer_usd is None
+    await provider.close()

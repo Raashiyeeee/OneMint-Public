@@ -106,12 +106,37 @@ class BaseMintProvider(ABC):
         """
         ...
 
-    @abstractmethod
     async def get_collection_floor_price(self, slug: str) -> Optional[RawCollectionStats]:
         """
-        Fetch the collection's floor-price stats.
+        Fetch the collection's floor-price stats (legacy proxy).
 
         Returns None if unavailable.
+        """
+        return None
+
+    @abstractmethod
+    async def get_collection_offer_price(
+        self,
+        slug: str,
+        chain: Optional[str] = None,
+        contract_address: Optional[str] = None,
+    ) -> Optional[float]:
+        """
+        Fetch the collection's highest active offer price in USD.
+
+        Parameters
+        ----------
+        slug : str
+            Collection slug.
+        chain : Optional[str]
+            Chain slug/identifier.
+        contract_address : Optional[str]
+            Contract address for resolving slug if needed.
+
+        Returns
+        -------
+        Optional[float]
+            Highest active offer price converted to USD, or None if no offers exist.
         """
         ...
 
@@ -121,7 +146,8 @@ class BaseMintProvider(ABC):
         raw: RawDrop,
         stage: RawDropStage,
         eth_price_usd: float,
-        floor_price_usd: Optional[float],
+        floor_price_usd: Optional[float] = None,
+        offer_price_usd: Optional[float] = None,
     ) -> MintOpportunity:
         """
         Convert a raw drop + stage pair into a normalised MintOpportunity.
@@ -135,7 +161,9 @@ class BaseMintProvider(ABC):
         eth_price_usd:
             Current ETH → USD conversion rate.
         floor_price_usd:
-            Collection floor price in USD (used as offer proxy).
+            Collection floor price in USD (legacy parameter).
+        offer_price_usd:
+            Collection best offer price in USD.
         """
         ...
 

@@ -263,6 +263,115 @@ class OpenSeaProvider(BaseMintProvider):
             )
             return None
 
+    async def get_collection_offer_price(
+        self,
+        slug: str,
+        chain: Optional[str] = None,
+        contract_address: Optional[str] = None,
+    ) -> Optional[float]:
+        """
+        Fetch the collection's highest active offer price in USD from OpenSea v2 API.
+        Endpoint: GET /api/v2/offers/collection/{slug}/all
+        """
+        import time
+
+        resolved_slug = slug
+        url = f"{self._base_url}/offers/collection/{resolved_slug}/all"
+        data = None
+
+        try:
+            data = await self._get(url, params={"limit": 20})
+        except aiohttp.ClientResponseError as exc:
+            if exc.status == 404 and chain and contract_address:
+                # Attempt to resolve collection slug from contract address
+                try:
+                    contract_url = f"{self._base_url}/chain/{chain}/contract/{contract_address}"
+                    contract_data = await self._get(contract_url)
+                    resolved_slug = contract_data.get("collection")
+                    if resolved_slug:
+                        url = f"{self._base_url}/offers/collection/{resolved_slug}/all"
+                        data = await self._get(url, params={"limit": 20})
+                except Exception as c_exc:
+                    log.debug(
+                        "[API_ERROR] Could not resolve collection for CA %s: %s",
+                        contract_address,
+                        c_exc,
+                    )
+            else:
+                log.warning(
+                    "[API_ERROR] get_collection_offer_price slug=%s error=%s", slug, exc
+                )
+                return None
+        except Exception as exc:
+            log.warning(
+                "[API_ERROR] get_collection_offer_price slug=%s error=%s", slug, exc
+            )
+            return None
+
+        if not data:
+            return None
+
+        offers = data.get("offers", [])
+        if not offers:
+            log.debug("[OFFERS] No offers found for collection slug=%s", resolved_slug)
+            return None
+
+        now_ts = time.time()
+        best_offer_usd: Optional[Decimal] = None
+        eth_price: Optional[Decimal] = None
+
+        for offer in offers:
+            status = offer.get("status")
+            if status and str(status).upper() != "ACTIVE":
+                continue
+
+            params = offer.get("protocol_data", {}).get("parameters", {})
+            end_time = params.get("endTime")
+            if end_time:
+                try:
+                    if float(end_time) < now_ts:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            price_info = offer.get("price") or {}
+            val_str = price_info.get("value")
+            if not val_str:
+                continue
+
+            try:
+                val_int = Decimal(str(val_str))
+                decimals = int(price_info.get("decimals") or 18)
+                token_amount = val_int / (Decimal(10) ** decimals)
+            except Exception:
+                continue
+
+            currency = (price_info.get("currency") or "WETH").upper()
+            if currency in ("ETH", "WETH"):
+                if eth_price is None:
+                    eth_price = await self.get_eth_price_usd()
+                offer_usd = token_amount * eth_price
+            elif currency in ("USDC", "USDT", "DAI", "USD", "USDBC"):
+                offer_usd = token_amount
+            else:
+                if eth_price is None:
+                    eth_price = await self.get_eth_price_usd()
+                offer_usd = token_amount * eth_price
+
+            if best_offer_usd is None or offer_usd > best_offer_usd:
+                best_offer_usd = offer_usd
+
+        if best_offer_usd is not None:
+            quantized = best_offer_usd.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            log.info(
+                "[OFFER_FOUND] Collection %s best active offer: $%s",
+                resolved_slug,
+                quantized,
+            )
+            return float(quantized)
+
+        return None
+
     async def get_eth_price_usd(self) -> Decimal:
         """
         Fetch the current ETH/USD price with multi-source fallback and 5-minute caching.
@@ -333,7 +442,8 @@ class OpenSeaProvider(BaseMintProvider):
         raw: RawDrop,
         stage: RawDropStage,
         eth_price_usd: float,
-        floor_price_usd: Optional[float],
+        floor_price_usd: Optional[float] = None,
+        offer_price_usd: Optional[float] = None,
     ) -> MintOpportunity:
         """
         Convert a raw (drop, stage) pair into a normalised MintOpportunity.
@@ -341,7 +451,7 @@ class OpenSeaProvider(BaseMintProvider):
         Monetary conversions
         --------------------
         - Mint price: stage.price (wei) → ETH → USD using eth_price_usd.
-        - Offer price: floor_price_usd (already USD).
+        - Offer price: offer_price_usd or floor_price_usd (already USD).
 
         Timestamps
         ----------
@@ -368,10 +478,11 @@ class OpenSeaProvider(BaseMintProvider):
             except InvalidOperation:
                 pass  # stays zero — validator will reject if needed
 
-        # ── Offer / floor price ─────────────────────────────────────────────
-        offer_price_usd: Optional[Decimal] = None
-        if floor_price_usd is not None:
-            offer_price_usd = Decimal(str(floor_price_usd)).quantize(
+        # ── Offer price ─────────────────────────────────────────────────────
+        target_offer = offer_price_usd if offer_price_usd is not None else floor_price_usd
+        final_offer_usd: Optional[Decimal] = None
+        if target_offer is not None:
+            final_offer_usd = Decimal(str(target_offer)).quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP
             )
 
@@ -416,7 +527,7 @@ class OpenSeaProvider(BaseMintProvider):
             mint_type=stage.stage_type,
             mint_price_eth=mint_price_eth,
             mint_price_usd=mint_price_usd,
-            offer_price_usd=offer_price_usd,
+            offer_price_usd=final_offer_usd,
             total_supply=total_supply,
             minted_quantity=minted_quantity,
             minted_percentage=minted_percentage,

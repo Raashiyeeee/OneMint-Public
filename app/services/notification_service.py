@@ -165,7 +165,7 @@ def _format_alert(mint: MintOpportunityDB) -> str:
         f"<b>Chain:</b> {chain}",
         "",
         f"<b>Mint Price:</b> {mint_price_str}",
-        f"<b>Floor Price:</b> {offer}",
+        f"<b>Offer Price:</b> {offer}",
         f"<b>Minted:</b> {minted_pct}",
         "",
         f"<b>Starts in:</b> {_esc(starts_in)}",
