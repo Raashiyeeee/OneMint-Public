@@ -40,6 +40,9 @@ services:
       - key: DATABASE_URL
         value: sqlite+aiosqlite:///./data/public_mint_bot.db
 
+      - key: NOTIFY_ALL_DISCOVERED
+        value: "true"
+
       # ── Webhook mode (active) ─────────────────────────────────────────────
       # Telegram pushes updates to this URL — no polling, no Conflict errors.
       # WEBHOOK_PORT 10000 is the port Render internally routes to.

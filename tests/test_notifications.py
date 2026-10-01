@@ -212,3 +212,17 @@ async def test_delete_target_message():
     assert res is True
     bot.delete_message.assert_called_once_with(chat_id=-100222, message_id=54321)
 
+
+def test_format_alert_with_rejection_reason():
+    """Alert message includes Auto-Filter Note when rejection_reason is present."""
+    mint_db = make_mint_db(
+        project_name="Mooncats",
+        mint_price_usd="26.90",
+    )
+    mint_db.rejection_reason = "mint_price_usd=26.90 > max=20"
+    text = _format_alert(mint_db)
+
+    assert "Auto-Filter Note:" in text
+    assert "mint_price_usd=26.90 &gt; max=20" in text
+    assert "Mooncats" in text
+

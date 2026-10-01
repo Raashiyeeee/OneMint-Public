@@ -73,6 +73,12 @@ class Settings(BaseSettings):
         default=True,
         description="Pass mints through when minted supply data is unavailable from API",
     )
+    # When True, sends notifications for ALL discovered mints immediately
+    # as each is discovered in the DB, allowing manual filtering.
+    notify_all_discovered: bool = Field(
+        default=True,
+        description="Send notifications for all discovered mints immediately for manual filtering",
+    )
 
     # ─── Scheduling ────────────────────────────────────────────────────────────
     notification_before_minutes: int = Field(

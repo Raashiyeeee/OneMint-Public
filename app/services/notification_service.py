@@ -158,17 +158,29 @@ def _format_alert(mint: MintOpportunityDB) -> str:
     else:
         starts_in = "Unknown"
 
-    return (
-        "🚨 <b>PUBLIC MINT ALERT</b>\n\n"
-        f"<b>Project:</b> {project}\n"
-        f"<b>Chain:</b> {chain}\n\n"
-        f"<b>Mint Price:</b> {mint_price_str}\n"
-        f"<b>Offer Price:</b> {offer}\n"
-        f"<b>Minted:</b> {minted_pct}\n\n"
-        f"<b>Starts in:</b> {_esc(starts_in)}\n\n"
-        f"🔗 <b>Mint:</b> <a href=\"{mint_url}\">Direct Link</a>\n"
-        f"📄 <b>Contract:</b> <code>{contract}</code>"
-    )
+    lines = [
+        "🚨 <b>PUBLIC MINT ALERT</b>",
+        "",
+        f"<b>Project:</b> {project}",
+        f"<b>Chain:</b> {chain}",
+        "",
+        f"<b>Mint Price:</b> {mint_price_str}",
+        f"<b>Offer Price:</b> {offer}",
+        f"<b>Minted:</b> {minted_pct}",
+        "",
+        f"<b>Starts in:</b> {_esc(starts_in)}",
+    ]
+    if getattr(mint, "rejection_reason", None):
+        lines.extend([
+            "",
+            f"⚠️ <b>Auto-Filter Note:</b> <i>{_esc(mint.rejection_reason)}</i>",
+        ])
+    lines.extend([
+        "",
+        f"🔗 <b>Mint:</b> <a href=\"{mint_url}\">Direct Link</a>",
+        f"📄 <b>Contract:</b> <code>{contract}</code>",
+    ])
+    return "\n".join(lines)
 
 
 def _esc(value: str | None) -> str:

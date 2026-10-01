@@ -21,6 +21,7 @@ from app.bot.handlers import (
     cmd_recent,
     cmd_removeadmin,
     cmd_removetarget,
+    cmd_sendtoday,
     cmd_setfilter,
     cmd_setinterval,
     cmd_start,
@@ -46,6 +47,7 @@ BOT_COMMANDS = [
     BotCommand("addtarget",    "Add a destination group or channel"),
     BotCommand("removetarget", "Remove a destination group or channel"),
     BotCommand("stats",        "Today's discovery stats"),
+    BotCommand("sendtoday",    "Send alerts for unnotified mints today"),
     BotCommand("recent",       "Last 5 qualified mints"),
     BotCommand("jobs",         "Show pending scheduled jobs"),
     BotCommand("admins",       "List all current admins"),
@@ -100,6 +102,7 @@ def build_application(token: str) -> Application:
     app.add_handler(CommandHandler("addtarget",    cmd_addtarget))
     app.add_handler(CommandHandler("removetarget", cmd_removetarget))
     app.add_handler(CommandHandler("stats",        cmd_stats))
+    app.add_handler(CommandHandler("sendtoday",    cmd_sendtoday))
     app.add_handler(CommandHandler("recent",       cmd_recent))
     app.add_handler(CommandHandler("jobs",         cmd_jobs))
     app.add_handler(CommandHandler("admins",       cmd_admins))

@@ -132,6 +132,7 @@ class MintProcessor:
 
         # ── Step 4: Filter ────────────────────────────────────────────────────
         result = self._filter.evaluate(mint)
+        rejection_reason: Optional[str] = None
         if not result.passed:
             log.info(
                 "[MINT_REJECTED] external_id=%s chain=%s rule=%s reason=%s",
@@ -143,31 +144,34 @@ class MintProcessor:
             if self._health:
                 self._health.rejected += 1
             mint.status = MintStatus.REJECTED
-            # Save rejected records for auditing (non-blocking)
-            try:
-                db_record, is_new = await mint_repo.save_mint(mint)
-                if is_new:
-                    await mint_repo.update_status(
-                        db_record.id,
-                        MintStatus.REJECTED,
-                        {"rejection_reason": result.reason},
-                    )
-                    await self._session.commit()
-            except Exception:
-                await self._session.rollback()
-            return
+            rejection_reason = result.reason
 
-        log.info(
-            "[MINT_QUALIFIED] external_id=%s project=%r chain=%s price=$%s offer=$%s minted=%s%%",
-            mint.external_id,
-            mint.project_name,
-            mint.chain,
-            mint.mint_price_usd,
-            mint.offer_price_usd,
-            mint.minted_percentage,
-        )
-        if self._health:
-            self._health.qualified += 1
+            # If manual filtering mode is OFF, discard and save for audit only
+            if not self._settings.notify_all_discovered:
+                try:
+                    db_record, is_new = await mint_repo.save_mint(mint)
+                    if is_new:
+                        await mint_repo.update_status(
+                            db_record.id,
+                            MintStatus.REJECTED,
+                            {"rejection_reason": result.reason},
+                        )
+                        await self._session.commit()
+                except Exception:
+                    await self._session.rollback()
+                return
+        else:
+            log.info(
+                "[MINT_QUALIFIED] external_id=%s project=%r chain=%s price=$%s offer=$%s minted=%s%%",
+                mint.external_id,
+                mint.project_name,
+                mint.chain,
+                mint.mint_price_usd,
+                mint.offer_price_usd,
+                mint.minted_percentage,
+            )
+            if self._health:
+                self._health.qualified += 1
 
         # ── Step 5: Deduplicate and save ──────────────────────────────────────
         db_record, is_new = await mint_repo.save_mint(mint)
@@ -180,14 +184,40 @@ class MintProcessor:
             await self._session.rollback()
             return
 
+        if rejection_reason:
+            db_record.rejection_reason = rejection_reason
+            await mint_repo.update_status(
+                db_record.id,
+                MintStatus.REJECTED,
+                {"rejection_reason": rejection_reason},
+            )
+
         # ── Step 6: Determine timing ──────────────────────────────────────────
         now = utcnow()
         mint_start = mint.mint_start_time
-        notification_at = notification_time(mint_start, self._settings.notification_before_minutes)
-        deletion_at = delete_time(mint_start, self._settings.delete_after_minutes)
 
-        # ── Step 7: Late-detection cases ──────────────────────────────────────
-        if now >= deletion_at:
+        # Calculate safe future deletion time
+        deletion_at: Optional[datetime] = None
+        if self._settings.delete_after_minutes > 0:
+            base_delete = delete_time(mint_start, self._settings.delete_after_minutes) if mint_start else None
+            min_future_delete = now + timedelta(minutes=self._settings.delete_after_minutes)
+            deletion_at = max(base_delete, min_future_delete) if base_delete else min_future_delete
+
+        # ── Step 7: Manual Filtering / Notify All Discovered ──────────────────
+        if self._settings.notify_all_discovered:
+            log.info(
+                "[MINT_DISCOVERY_ALERT] Sending immediate alert for discovered mint: %s (%s)",
+                db_record.id,
+                db_record.project_name,
+            )
+            await self._session.commit()
+            await self._send_now(db_record, deletion_at, notif_repo)
+            return
+
+        # ── Step 8: Standard Late-detection cases ─────────────────────────────
+        notification_at = notification_time(mint_start, self._settings.notification_before_minutes)
+
+        if deletion_at and now >= deletion_at:
             # Case 4: mint is expired
             log.info(
                 "[MINT_EXPIRED] external_id=%s mint_started=%s mins_ago=%.1f",
@@ -199,9 +229,7 @@ class MintProcessor:
             await self._session.commit()
             return
 
-        # ── Step 8: Schedule or send ──────────────────────────────────────────
-        mint_status = MintStatus.SCHEDULED
-
+        # ── Step 9: Schedule or send ──────────────────────────────────────────
         if now >= notification_at:
             # Cases 2 & 3: send immediately
             await self._session.commit()  # Save record first
@@ -293,12 +321,13 @@ class MintProcessor:
         await self._session.commit()
 
         # Schedule deletion
-        self._scheduler.schedule_deletion(
-            mint_id=db_record.id,
-            message_id=primary_msg_id,
-            run_at=deletion_at,
-            delete_fn=self._delete_scheduled,
-        )
+        if deletion_at:
+            self._scheduler.schedule_deletion(
+                mint_id=db_record.id,
+                message_id=primary_msg_id,
+                run_at=deletion_at,
+                delete_fn=self._delete_scheduled,
+            )
 
     async def _send_scheduled(self, mint_id: str) -> None:
         """Called by APScheduler when the scheduled notification time arrives."""

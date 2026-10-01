@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -312,6 +312,39 @@ class MintMonitor:
                         run_at.isoformat(),
                     )
 
+        # In manual filtering mode, also recover & alert any unnotified mints from today
+        if self._settings.notify_all_discovered:
+            today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+            async with factory() as session:
+                result = await session.execute(
+                    select(MintOpportunityDB).where(
+                        MintOpportunityDB.created_at >= today_start,
+                        MintOpportunityDB.notification_sent_at.is_(None),
+                    )
+                )
+                unnotified_today = list(result.scalars().all())
+
+            if unnotified_today:
+                log.info(
+                    "[MONITOR_CYCLE] Found %d unnotified mints from today in manual filtering mode — sending alerts now",
+                    len(unnotified_today),
+                )
+                for unnotified in unnotified_today:
+                    try:
+                        send_fn = self._make_send_fn(unnotified)
+                        await send_fn(unnotified.id)
+                        log.info(
+                            "[MONITOR_CYCLE] Dispatched alert for unnotified mint: %s (%s)",
+                            unnotified.id,
+                            unnotified.project_name,
+                        )
+                    except Exception as exc:
+                        log.error(
+                            "[MONITOR_CYCLE] Failed to send unnotified mint %s: %s",
+                            unnotified.id,
+                            exc,
+                        )
+
         log.info(
             "[MONITOR_CYCLE] Recovery complete — recovered %d records", len(records)
         )
@@ -367,9 +400,15 @@ class MintMonitor:
                 self.health.notifications_sent += len(sent_messages)
 
                 mint_start = rec.mint_start_time
-                if mint_start.tzinfo is None:
+                if mint_start and mint_start.tzinfo is None:
                     mint_start = mint_start.replace(tzinfo=timezone.utc)
-                del_at = delete_time(mint_start, settings.delete_after_minutes)
+
+                now_dt = datetime.now(timezone.utc)
+                del_at: Optional[datetime] = None
+                if settings.delete_after_minutes > 0:
+                    base_del = delete_time(mint_start, settings.delete_after_minutes) if mint_start else None
+                    min_del = now_dt + timedelta(minutes=settings.delete_after_minutes)
+                    del_at = max(base_del, min_del) if base_del else min_del
 
                 primary_msg_id = sent_messages[0][1]
                 notif_repo = NotificationRepository(session)
@@ -391,12 +430,13 @@ class MintMonitor:
                 )
                 await session.commit()
 
-            self._scheduler.schedule_deletion(
-                mint_id=mint_id,
-                message_id=primary_msg_id,
-                run_at=del_at,
-                delete_fn=self._make_delete_fn(),
-            )
+            if del_at:
+                self._scheduler.schedule_deletion(
+                    mint_id=mint_id,
+                    message_id=primary_msg_id,
+                    run_at=del_at,
+                    delete_fn=self._make_delete_fn(),
+                )
 
         return _send
 
