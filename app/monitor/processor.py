@@ -205,6 +205,35 @@ class MintProcessor:
 
         # ── Step 7: Manual Filtering / Notify All Discovered ──────────────────
         if self._settings.notify_all_discovered:
+            # Suppress if the mint has already ended (expired)
+            if mint.mint_end_time and utcnow() >= mint.mint_end_time:
+                log.info(
+                    "[MINT_EXPIRED] Skipping discovery alert — mint already ended: "
+                    "external_id=%s end_time=%s",
+                    mint.external_id,
+                    mint.mint_end_time.isoformat(),
+                )
+                await mint_repo.update_status(db_record.id, MintStatus.EXPIRED)
+                await self._session.commit()
+                return
+
+            # Suppress if there is no meaningful price info at all (no floor, no mint price)
+            if (mint.offer_price_usd is None and
+                    (mint.mint_price_usd is None or mint.mint_price_usd == Decimal("0"))):
+                log.info(
+                    "[MINT_SKIP] Suppressing discovery alert — no offer price and no mint price: "
+                    "external_id=%s chain=%s",
+                    mint.external_id,
+                    mint.chain,
+                )
+                await mint_repo.update_status(
+                    db_record.id,
+                    MintStatus.REJECTED,
+                    {"rejection_reason": "no_offer_price_and_no_mint_price"},
+                )
+                await self._session.commit()
+                return
+
             log.info(
                 "[MINT_DISCOVERY_ALERT] Sending immediate alert for discovered mint: %s (%s)",
                 db_record.id,
@@ -351,7 +380,13 @@ async def _run_send_job(mint_id: str) -> None:
     from sqlalchemy import select
 
     settings = get_settings()
-    notifier = TelegramNotificationService(settings)
+    from telegram import Bot
+    bot = Bot(token=settings.telegram_bot_token)
+    notifier = TelegramNotificationService(
+        bot=bot,
+        chat_id=settings.telegram_group_id,
+        topic_id=settings.public_mint_topic_id,
+    )
     factory = get_session_factory()
 
     async with factory() as session:
@@ -442,7 +477,13 @@ async def _run_delete_job(mint_id: str, message_id: int) -> None:
     from app.config import get_settings
 
     settings = get_settings()
-    notifier = TelegramNotificationService(settings)
+    from telegram import Bot
+    bot = Bot(token=settings.telegram_bot_token)
+    notifier = TelegramNotificationService(
+        bot=bot,
+        chat_id=settings.telegram_group_id,
+        topic_id=settings.public_mint_topic_id,
+    )
     factory = get_session_factory()
 
     async with factory() as session:
