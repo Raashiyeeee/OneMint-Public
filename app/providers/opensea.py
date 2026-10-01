@@ -325,6 +325,10 @@ class OpenSeaProvider(BaseMintProvider):
             if status and str(status).upper() != "ACTIVE":
                 continue
 
+            # Verify that the offer is specifically for the drop's contract address (CA)
+            if contract_address and not _offer_matches_contract(offer, contract_address):
+                continue
+
             params = offer.get("protocol_data", {}).get("parameters", {})
             end_time = params.get("endTime")
             if end_time:
@@ -549,3 +553,47 @@ def _parse_dt(iso_str: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _offer_matches_contract(offer: dict, target_contract: Optional[str]) -> bool:
+    """
+    Check if an OpenSea offer is specifically for target_contract (address).
+
+    If target_contract is None, returns True.
+    """
+    if not target_contract:
+        return True
+
+    target_ca = target_contract.lower().strip()
+
+    # 1. Direct asset contract check
+    asset = offer.get("asset")
+    if isinstance(asset, dict):
+        c = asset.get("contract")
+        if c:
+            return str(c).lower() == target_ca
+
+    # 2. Criteria contract check (collection/trait offers)
+    criteria = offer.get("criteria")
+    if isinstance(criteria, dict):
+        c_obj = criteria.get("contract")
+        if isinstance(c_obj, dict):
+            c_addr = c_obj.get("address")
+            if c_addr:
+                return str(c_addr).lower() == target_ca
+
+    # 3. Protocol consideration items (Seaport protocol parameters)
+    # itemType 2 (ERC721), 3 (ERC1155), 4 (ERC721_WITH_CRITERIA), 5 (ERC1155_WITH_CRITERIA)
+    params = offer.get("protocol_data", {}).get("parameters", {})
+    found_nft_item = False
+    for item in params.get("consideration", []):
+        if item.get("itemType") in (2, 3, 4, 5):
+            found_nft_item = True
+            token = str(item.get("token", "")).lower()
+            if token == target_ca:
+                return True
+
+    if found_nft_item:
+        return False
+
+    return True

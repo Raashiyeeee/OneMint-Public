@@ -228,3 +228,50 @@ async def test_get_collection_offer_price_empty(monkeypatch):
     offer_usd = await provider.get_collection_offer_price("no-offers-slug")
     assert offer_usd is None
     await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_get_collection_offer_price_filters_by_contract_address(monkeypatch):
+    """Offers targeting a different contract address in the same collection slug are ignored."""
+    provider = OpenSeaProvider(api_key="test-key-not-used")
+
+    mock_resp = {
+        "offers": [
+            {
+                "status": "ACTIVE",
+                "price": {"currency": "WETH", "decimals": 18, "value": "1000000000000000"},
+                "protocol_data": {
+                    "parameters": {
+                        "endTime": "9999999999",
+                        "consideration": [
+                            {"itemType": 3, "token": "0xOTHER_CONTRACT"},
+                        ],
+                    }
+                },
+            }
+        ]
+    }
+
+    async def mock_get(url, params=None):
+        return mock_resp
+
+    monkeypatch.setattr(provider, "_get", mock_get)
+
+    # Calling with target contract 0xMY_CONTRACT should ignore the offer for 0xOTHER_CONTRACT
+    offer_usd = await provider.get_collection_offer_price(
+        "test-collection",
+        contract_address="0xMY_CONTRACT",
+    )
+    assert offer_usd is None
+
+    # Calling with target contract 0xOTHER_CONTRACT should match it
+    async def mock_eth():
+        return Decimal("2000")
+
+    monkeypatch.setattr(provider, "get_eth_price_usd", mock_eth)
+    matched_usd = await provider.get_collection_offer_price(
+        "test-collection",
+        contract_address="0xOTHER_CONTRACT",
+    )
+    assert matched_usd == 2.00
+    await provider.close()
