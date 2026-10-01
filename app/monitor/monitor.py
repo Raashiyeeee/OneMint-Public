@@ -24,7 +24,7 @@ from app.config import Settings
 from app.database.database import get_session_factory
 from app.database.models import MintOpportunityDB, NotificationDB
 from app.database.repository import SystemStateRepository
-from app.monitor.processor import MintProcessor
+from app.monitor.processor import MintProcessor, _run_delete_job
 from app.monitor.scheduler import MintScheduler
 from app.providers.base import RawDropStage
 from app.providers.opensea import OpenSeaProvider
@@ -304,7 +304,7 @@ class MintMonitor:
                         mint_id=record.id,
                         message_id=msg_id,
                         run_at=run_at,
-                        delete_fn=self._make_delete_fn(),
+                        delete_fn=_run_delete_job,
                     )
                     log.info(
                         "[MONITOR_CYCLE] Recovered NOTIFIED mint deletion: %s delete_at=%s",
@@ -435,42 +435,8 @@ class MintMonitor:
                     mint_id=mint_id,
                     message_id=primary_msg_id,
                     run_at=del_at,
-                    delete_fn=self._make_delete_fn(),
+                    delete_fn=_run_delete_job,
                 )
 
         return _send
 
-    def _make_delete_fn(self):
-        """Create a closure for the scheduler to delete a notification."""
-        notifier = self._notifier
-
-        async def _delete(mint_id: str, message_id: int) -> None:
-            from app.database.database import get_session_factory
-            from app.database.repository import MintRepository, NotificationRepository
-            from app.models.mint import MintStatus
-            from app.utils.time import utcnow
-
-            factory = get_session_factory()
-            async with factory() as session:
-                notif_repo = NotificationRepository(session)
-                notifs = await notif_repo.get_all_by_mint_id(mint_id)
-                deleted_any = False
-                for notif in notifs:
-                    if notif.deleted_at is None:
-                        ok = await notifier.delete_target_message(notif.chat_id, notif.message_id, mint_id)
-                        if ok:
-                            notif.deleted_at = utcnow()
-                            deleted_any = True
-
-                if not notifs:
-                    deleted_any = await notifier.delete_mint_alert(message_id, mint_id)
-
-                if deleted_any:
-                    self.health.deletions += 1
-
-                status = MintStatus.DELETED if deleted_any else MintStatus.FAILED
-                extra = {"deleted_at": utcnow()} if deleted_any else {}
-                await MintRepository(session).update_status(mint_id, status, extra)
-                await session.commit()
-
-        return _delete

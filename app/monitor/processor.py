@@ -249,7 +249,7 @@ class MintProcessor:
             self._scheduler.schedule_notification(
                 mint_id=db_record.id,
                 run_at=notification_at,
-                send_fn=self._send_scheduled,
+                send_fn=_run_send_job,
             )
 
     # ── Internal helpers ──────────────────────────────────────────────────────
@@ -326,106 +326,143 @@ class MintProcessor:
                 mint_id=db_record.id,
                 message_id=primary_msg_id,
                 run_at=deletion_at,
-                delete_fn=self._delete_scheduled,
+                delete_fn=_run_delete_job,
             )
 
-    async def _send_scheduled(self, mint_id: str) -> None:
-        """Called by APScheduler when the scheduled notification time arrives."""
-        from app.database.database import get_session_factory
-        from sqlalchemy import select
+    # _send_scheduled and _delete_scheduled have been promoted to module-level
+    # functions (_run_send_job / _run_delete_job) so APScheduler can pickle them.
 
-        factory = get_session_factory()
-        async with factory() as session:
-            result = await session.execute(
-                select(MintOpportunityDB).where(MintOpportunityDB.id == mint_id)
-            )
-            db_record = result.scalar_one_or_none()
-            if db_record is None:
-                log.error("[SCHEDULER] Mint not found for send job: %s", mint_id)
-                return
 
-            if db_record.status not in (MintStatus.SCHEDULED.value, MintStatus.VALIDATED.value):
-                log.info(
-                    "[SCHEDULER] Skipping send — status=%s mint_id=%s",
-                    db_record.status,
-                    mint_id,
-                )
-                return
 
-            targets = await self._get_all_broadcast_targets(session)
-            sent_messages: list[tuple[int, int, Optional[int]]] = []
-            for chat_id, topic_id in targets:
-                msg_id = await self._notifier.send_to_target(db_record, chat_id, topic_id)
-                if msg_id:
-                    sent_messages.append((chat_id, msg_id, topic_id))
 
-            if not sent_messages:
-                await MintRepository(session).update_status(mint_id, MintStatus.FAILED)
-                await session.commit()
-                return
+# ---------------------------------------------------------------------------
+# Module-level APScheduler job functions
+# ---------------------------------------------------------------------------
+# These MUST be module-level (not bound methods) so APScheduler's SQLAlchemy
+# job store can pickle them. They only accept primitive args (str / int) and
+# reconstruct every dependency internally via get_settings() / get_session_factory().
 
-            if self._health:
-                self._health.notifications_sent += len(sent_messages)
 
-            deletion_at = db_record.delete_scheduled_at
-            notif_repo = NotificationRepository(session)
-            primary_msg_id = sent_messages[0][1]
+async def _run_send_job(mint_id: str) -> None:
+    """APScheduler callback: send notification for a scheduled mint."""
+    from app.database.database import get_session_factory
+    from app.database.repository import TargetRepository
+    from app.config import get_settings
+    from sqlalchemy import select
 
-            for chat_id, msg_id, topic_id in sent_messages:
-                notif = NotificationDB(
-                    id=str(uuid.uuid4()),
-                    mint_id=mint_id,
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    message_thread_id=topic_id,
-                    delete_scheduled_at=deletion_at,
-                )
-                await notif_repo.save_notification(notif)
+    settings = get_settings()
+    notifier = TelegramNotificationService(settings)
+    factory = get_session_factory()
 
-            await MintRepository(session).update_status(
+    async with factory() as session:
+        result = await session.execute(
+            select(MintOpportunityDB).where(MintOpportunityDB.id == mint_id)
+        )
+        db_record = result.scalar_one_or_none()
+        if db_record is None:
+            log.error("[SCHEDULER] Mint not found for send job: %s", mint_id)
+            return
+
+        if db_record.status not in (MintStatus.SCHEDULED.value, MintStatus.VALIDATED.value):
+            log.info(
+                "[SCHEDULER] Skipping send — status=%s mint_id=%s",
+                db_record.status,
                 mint_id,
-                MintStatus.NOTIFIED,
-                {
-                    "notification_sent_at": utcnow(),
-                    "notification_message_id": primary_msg_id,
-                },
             )
-            await session.commit()
+            return
 
-        if deletion_at:
-            self._scheduler.schedule_deletion(
+        # Collect broadcast targets
+        targets: list[tuple[int, Optional[int]]] = [
+            (settings.telegram_group_id, settings.public_mint_topic_id)
+        ]
+        try:
+            extra_targets = await TargetRepository(session).get_all_active()
+            seen = {(settings.telegram_group_id, settings.public_mint_topic_id)}
+            for t in extra_targets:
+                key = (t.chat_id, t.topic_id)
+                if key not in seen:
+                    targets.append(key)
+                    seen.add(key)
+        except Exception:
+            pass
+
+        sent_messages: list[tuple[int, int, Optional[int]]] = []
+        for chat_id, topic_id in targets:
+            msg_id = await notifier.send_to_target(db_record, chat_id, topic_id)
+            if msg_id:
+                sent_messages.append((chat_id, msg_id, topic_id))
+
+        if not sent_messages:
+            await MintRepository(session).update_status(mint_id, MintStatus.FAILED)
+            await session.commit()
+            return
+
+        deletion_at = db_record.delete_scheduled_at
+        notif_repo = NotificationRepository(session)
+        primary_msg_id = sent_messages[0][1]
+
+        for chat_id, msg_id, topic_id in sent_messages:
+            notif = NotificationDB(
+                id=str(uuid.uuid4()),
                 mint_id=mint_id,
-                message_id=primary_msg_id,
-                run_at=deletion_at,
-                delete_fn=self._delete_scheduled,
+                chat_id=chat_id,
+                message_id=msg_id,
+                message_thread_id=topic_id,
+                delete_scheduled_at=deletion_at,
             )
+            await notif_repo.save_notification(notif)
 
-    async def _delete_scheduled(self, mint_id: str, message_id: int) -> None:
-        """Called by APScheduler when the deletion time arrives."""
-        from app.database.database import get_session_factory
+        await MintRepository(session).update_status(
+            mint_id,
+            MintStatus.NOTIFIED,
+            {
+                "notification_sent_at": utcnow(),
+                "notification_message_id": primary_msg_id,
+            },
+        )
+        await session.commit()
 
-        factory = get_session_factory()
-        async with factory() as session:
-            notif_repo = NotificationRepository(session)
-            notifs = await notif_repo.get_all_by_mint_id(mint_id)
-            deleted_any = False
-            for notif in notifs:
-                if notif.deleted_at is None:
-                    ok = await self._notifier.delete_target_message(notif.chat_id, notif.message_id, mint_id)
-                    if ok:
-                        notif.deleted_at = utcnow()
-                        deleted_any = True
+    if deletion_at:
+        from app.monitor.scheduler import MintScheduler
+        from app.config import get_settings as _gs
+        _settings = _gs()
+        sync_url = _settings.database_url.replace("sqlite+aiosqlite", "sqlite")
+        sched = MintScheduler(sync_url)
+        sched.schedule_deletion(
+            mint_id=mint_id,
+            message_id=primary_msg_id,
+            run_at=deletion_at,
+            delete_fn=_run_delete_job,
+        )
 
-            if not notifs:
-                deleted_any = await self._notifier.delete_mint_alert(message_id, mint_id)
 
-            if deleted_any and self._health:
-                self._health.deletions += 1
+async def _run_delete_job(mint_id: str, message_id: int) -> None:
+    """APScheduler callback: delete a previously sent Telegram notification."""
+    from app.database.database import get_session_factory
+    from app.config import get_settings
 
-            status = MintStatus.DELETED if deleted_any else MintStatus.FAILED
-            extra = {"deleted_at": utcnow()} if deleted_any else {}
-            await MintRepository(session).update_status(mint_id, status, extra)
-            await session.commit()
+    settings = get_settings()
+    notifier = TelegramNotificationService(settings)
+    factory = get_session_factory()
+
+    async with factory() as session:
+        notif_repo = NotificationRepository(session)
+        notifs = await notif_repo.get_all_by_mint_id(mint_id)
+        deleted_any = False
+        for notif in notifs:
+            if notif.deleted_at is None:
+                ok = await notifier.delete_target_message(notif.chat_id, notif.message_id, mint_id)
+                if ok:
+                    notif.deleted_at = utcnow()
+                    deleted_any = True
+
+        if not notifs:
+            deleted_any = await notifier.delete_mint_alert(message_id, mint_id)
+
+        status = MintStatus.DELETED if deleted_any else MintStatus.FAILED
+        extra = {"deleted_at": utcnow()} if deleted_any else {}
+        await MintRepository(session).update_status(mint_id, status, extra)
+        await session.commit()
 
 
 # ---------------------------------------------------------------------------
