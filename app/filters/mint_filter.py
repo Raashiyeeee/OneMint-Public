@@ -141,7 +141,7 @@ class MintFilter:
             if self._cfg.allow_missing_offer:
                 log.warning(
                     "[FILTER_WARN] external_id=%s chain=%s "
-                    "field=offer_price_usd reason=no_floor_price_available "
+                    "field=offer_price_usd reason=no_offer_price_available "
                     "action=passing_through (allow_missing_offer=True)",
                     mint.external_id,
                     mint.chain,
@@ -149,14 +149,14 @@ class MintFilter:
                 return None  # pass through
             log.warning(
                 "[REQUIRED_FIELD_UNAVAILABLE] external_id=%s chain=%s "
-                "field=offer_price_usd reason=no_floor_price_available",
+                "field=offer_price_usd reason=no_offer_price_available",
                 mint.external_id,
                 mint.chain,
             )
             return FilterResult(
                 passed=False,
                 rule="RULE3_4_OFFER",
-                reason="offer_price_usd unavailable (no floor price from API)",
+                reason="offer_price_usd unavailable (no offer price from API)",
             )
 
         offer = mint.offer_price_usd

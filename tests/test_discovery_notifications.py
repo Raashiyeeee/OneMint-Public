@@ -179,6 +179,7 @@ async def test_notify_all_discovered_does_not_renotify_duplicate(db_session):
         contract_address=raw.contract_address,
         mint_type="public_sale",
         mint_price_usd=Decimal("50.00"),
+        offer_price_usd=Decimal("100.00"),
         mint_start_time=datetime.now(timezone.utc) + timedelta(hours=2),
         mint_url="https://opensea.io/collection/high-price-nft",
         collection_slug=raw.collection_slug,
@@ -206,3 +207,45 @@ async def test_notify_all_discovered_does_not_renotify_duplicate(db_session):
     mock_notifier.send_to_target.reset_mock()
     await processor.process(raw, stage)
     assert mock_notifier.send_to_target.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_notify_all_discovered_suppresses_when_offer_not_greater_than_mint_price(db_session):
+    """When notify_all_discovered=True, mints where offer_price <= mint_price are suppressed."""
+    settings = make_settings(notify_all_discovered=True)
+    raw, stage = make_raw_drop_and_stage()
+
+    mock_provider = AsyncMock()
+    mock_provider.get_mint_details.return_value = None
+    mock_provider.get_collection_floor_price.return_value = None
+
+    # Offer price $2.42 < mint price $15.05
+    mint_opp = MintOpportunity(
+        external_id=stage.uuid,
+        project_name=raw.collection_name,
+        chain=raw.chain,
+        contract_address=raw.contract_address,
+        mint_type="public_sale",
+        mint_price_usd=Decimal("15.05"),
+        offer_price_usd=Decimal("2.42"),
+        mint_start_time=datetime.now(timezone.utc) + timedelta(hours=2),
+        mint_url="https://opensea.io/collection/collectr",
+        collection_slug=raw.collection_slug,
+    )
+    mock_provider.normalize_mint.return_value = mint_opp
+
+    mock_scheduler = MagicMock()
+    mock_notifier = AsyncMock()
+
+    processor = MintProcessor(
+        settings=settings,
+        provider=mock_provider,
+        session=db_session,
+        scheduler=mock_scheduler,
+        notifier=mock_notifier,
+        eth_price_usd=Decimal("2500"),
+    )
+
+    await processor.process(raw, stage)
+    # Verification: notifier NOT called because offer ($2.42) <= mint price ($15.05)
+    assert not mock_notifier.send_to_target.called

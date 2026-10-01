@@ -218,19 +218,22 @@ class MintProcessor:
                 await self._session.commit()
                 return
 
-            # Suppress if there is no meaningful price info at all (no floor, no mint price)
-            if (mint.offer_price_usd is None and
-                    (mint.mint_price_usd is None or mint.mint_price_usd == Decimal("0"))):
+            # Suppress if offer price is missing or not strictly greater than mint price
+            # (Only alert when offer_price > mint_price)
+            mint_price = mint.mint_price_usd or Decimal("0")
+            if mint.offer_price_usd is None or mint.offer_price_usd <= mint_price:
                 log.info(
-                    "[MINT_SKIP] Suppressing discovery alert — no offer price and no mint price: "
+                    "[MINT_SKIP] Suppressing discovery alert — offer price ($%s) is not greater than mint price ($%s): "
                     "external_id=%s chain=%s",
+                    mint.offer_price_usd,
+                    mint_price,
                     mint.external_id,
                     mint.chain,
                 )
                 await mint_repo.update_status(
                     db_record.id,
                     MintStatus.REJECTED,
-                    {"rejection_reason": "no_offer_price_and_no_mint_price"},
+                    {"rejection_reason": f"offer_price_usd ({mint.offer_price_usd}) <= mint_price_usd ({mint_price})"},
                 )
                 await self._session.commit()
                 return
