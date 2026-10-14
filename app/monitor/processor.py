@@ -350,39 +350,125 @@ class AlertService:
                 await session.commit()
                 return False
 
-            self._apply_snapshot(rec, mint)
-            rec.rejection_reason = None
-            chat_id = self._settings.telegram_group_id
-            topic_id = self._settings.public_mint_topic_id
-            msg_id = await self._notifier.send_to_target(rec, chat_id, topic_id)
-            if not msg_id:
-                rec.status = MintStatus.FAILED.value
-                rec.rejection_reason = "telegram send failed"
-                await session.commit()
-                return False
+            msg_id = await self._deliver(session, rec, mint, start)
+        return msg_id is not None
 
-            del_at = deletion_time(start)
-            session.add(
-                NotificationDB(
-                    id=str(uuid.uuid4()),
-                    mint_id=mint_id,
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    message_thread_id=topic_id,
-                    delete_scheduled_at=del_at,
-                )
-            )
-            rec.status = MintStatus.NOTIFIED.value
-            rec.notification_sent_at = utcnow()
-            rec.notification_message_id = msg_id
-            rec.delete_scheduled_at = del_at
+    async def _deliver(self, session, rec: MintOpportunityDB, mint: MintOpportunity, start: datetime) -> Optional[int]:
+        """Send to the configured group/topic only, record it, schedule deletion at start+10."""
+        mint_id = rec.id
+        self._apply_snapshot(rec, mint)
+        rec.rejection_reason = None
+        chat_id = self._settings.telegram_group_id
+        topic_id = self._settings.public_mint_topic_id
+        msg_id = await self._notifier.send_to_target(rec, chat_id, topic_id)
+        if not msg_id:
+            rec.status = MintStatus.FAILED.value
+            rec.rejection_reason = "telegram send failed"
             await session.commit()
-
+            return None
+        del_at = deletion_time(start)
+        session.add(
+            NotificationDB(
+                id=str(uuid.uuid4()),
+                mint_id=mint_id,
+                chat_id=chat_id,
+                message_id=msg_id,
+                message_thread_id=topic_id,
+                delete_scheduled_at=del_at,
+            )
+        )
+        rec.status = MintStatus.NOTIFIED.value
+        rec.notification_sent_at = utcnow()
+        rec.notification_message_id = msg_id
+        rec.delete_scheduled_at = del_at
+        await session.commit()
         if self._health:
             self._health.notifications_sent += 1
         self._schedule_delete(mint_id, msg_id, del_at)
         log.info("[ALERT_SENT] mint_id=%s message_id=%s delete_at=%s", mint_id, msg_id, del_at.isoformat())
-        return True
+        return msg_id
+
+    # ── manual /sendtoday ─────────────────────────────────────────────────────
+
+    async def send_today(self) -> list[dict]:
+        """Admin-triggered early alerts for today's (UTC) upcoming mints.
+
+        Each candidate is re-checked on fresh data; passing ones are sent now
+        to the configured group/topic only, recorded as NOTIFIED (so the
+        automatic start-15m job will skip them) and get deletion at start+10.
+        Returns [{mint_id, name, start, sent: bool, reason}].
+        """
+        now = self._now()
+        day_end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        results: list[dict] = []
+        async with self._factory()() as session:
+            rows = (
+                await session.execute(
+                    select(MintOpportunityDB).where(
+                        MintOpportunityDB.status.notin_(
+                            [MintStatus.DELETED.value, MintStatus.EXPIRED.value]
+                        )
+                    )
+                )
+            ).scalars().all()
+            # Filter in Python on UTC-aware values (DB drivers differ on tz handling).
+            rows = sorted(
+                (r for r in rows if now < ensure_utc(r.mint_start_time) < day_end),
+                key=lambda r: ensure_utc(r.mint_start_time),
+            )
+            ids = [r.id for r in rows]
+
+        for mint_id in ids:
+            async with self._factory()() as session:
+                rec = await session.get(MintOpportunityDB, mint_id)
+                start = ensure_utc(rec.mint_start_time)
+                item = {"mint_id": mint_id, "name": rec.project_name, "start": start, "sent": False, "reason": ""}
+                results.append(item)
+                if self._now() >= start:
+                    item["reason"] = "already started"
+                    continue
+                notifs = await NotificationRepository(session).get_all_by_mint_id(mint_id)
+                if rec.notification_sent_at is not None or notifs or rec.status in ACTIVE_SENT + (MintStatus.DELETED.value,):
+                    item["reason"] = "already alerted"
+                    continue
+                prev_status = rec.status
+                claimed = await session.execute(
+                    update(MintOpportunityDB)
+                    .where(
+                        MintOpportunityDB.id == mint_id,
+                        MintOpportunityDB.status == prev_status,
+                        MintOpportunityDB.notification_sent_at.is_(None),
+                    )
+                    .values(status=MintStatus.SENDING.value)
+                )
+                await session.commit()
+                if claimed.rowcount != 1:
+                    item["reason"] = "being sent by another job"
+                    continue
+                fresh = await self._recheck(rec)
+                if isinstance(fresh, str):
+                    rec.status = prev_status  # leave the automatic path untouched
+                    await session.commit()
+                    item["reason"] = fresh
+                    continue
+                if fresh.mint_start_time != start:
+                    rec.status = prev_status
+                    await session.commit()
+                    item["reason"] = "start time changed on fresh data; will be rescheduled by next poll"
+                    continue
+                if self._now() >= start:
+                    rec.status = prev_status
+                    await session.commit()
+                    item["reason"] = "started during re-check"
+                    continue
+                msg_id = await self._deliver(session, rec, fresh, start)
+                if msg_id is None:
+                    item["reason"] = "telegram send failed"
+                    continue
+                self._scheduler.cancel_job(f"notify_{mint_id}")
+                item["sent"] = True
+                item["reason"] = f"sent (message {msg_id})"
+        return results
 
     async def _recheck(self, rec: MintOpportunityDB):
         """Return a fresh MintOpportunity that passes every rule, or a reason string."""

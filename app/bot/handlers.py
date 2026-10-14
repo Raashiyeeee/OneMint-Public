@@ -608,15 +608,41 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── /sendtoday ─────────────────────────────────────────────────────────────────
 
 async def cmd_sendtoday(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/sendtoday is disabled: the spec allows exactly one alert per mint phase,
-    sent only at mint_start − 15 min, never on discovery or on demand."""
+    """/sendtoday (admin only) — alert now for today's (UTC) upcoming mints that
+    pass every rule on fresh data. Sent only to the configured group/topic and
+    recorded so the automatic start−15m alert does not duplicate it."""
     if not _admin_check(update, context):
         await _reject_unauthorized(update, context)
         return
-    await (update.effective_message or update.message).reply_text(
-        "ℹ️ /sendtoday is disabled. Alerts are sent automatically, once, "
-        "15 minutes before each qualifying public mint starts."
-    )
+    reply = (update.effective_message or update.message).reply_text
+    monitor: MintMonitor | None = context.bot_data.get("monitor")
+    if not monitor:
+        await reply("❌ Monitor not available.")
+        return
+    try:
+        results = await monitor.alerts.send_today()
+    except Exception as exc:
+        log.error("[BOT] cmd_sendtoday error: %s", exc)
+        await reply(f"❌ Error sending alerts: {html.escape(str(exc))}")
+        return
+    await reply(format_sendtoday_summary(results), parse_mode="HTML")
+
+
+def format_sendtoday_summary(results: list[dict]) -> str:
+    if not results:
+        return "ℹ️ No upcoming mints today (UTC) to alert."
+    sent = [r for r in results if r["sent"]]
+    skipped = [r for r in results if not r["sent"]]
+    lines = [f"📤 <b>/sendtoday</b>: {len(sent)} sent, {len(skipped)} skipped"]
+    if sent:
+        lines += ["", "<b>Sent:</b>"] + [
+            f"✅ {html.escape(r['name'])} — starts {r['start'].strftime('%H:%M')} UTC" for r in sent
+        ]
+    if skipped:
+        lines += ["", "<b>Skipped:</b>"] + [
+            f"⏭ {html.escape(r['name'])} — {html.escape(r['reason'])}" for r in skipped
+        ]
+    return "\n".join(lines)
 
 
 # ── /recent ────────────────────────────────────────────────────────────────────
