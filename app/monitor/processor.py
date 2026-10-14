@@ -1,513 +1,559 @@
 """
-Mint processor — orchestrates the full pipeline for a single mint opportunity.
+Alert lifecycle — discovery, scheduling, pre-send re-check, send, delete,
+reschedule and restart recovery.
 
-Pipeline
---------
-raw API data → normalize → validate → filter → deduplicate → save → schedule
+Spec mapping
+------------
+Rule 1/2  eligibility + offer ratio      -> app.filters.mint_filter.MintFilter
+Rule 3    one alert at start - 15 min    -> AlertService.process / send_alert
+          never on discovery, never at/after start, re-check before sending,
+          only to TELEGRAM_GROUP_ID + PUBLIC_MINT_TOPIC_ID
+Rule 4    delete at start + 10 min       -> AlertService.send_alert / delete_alert
+Rule 5    dedupe, UTC, reschedule on start change, persistence + recovery
+                                         -> AlertService.process / recover
 
-Late-detection logic
---------------------
-Case 1: mint_start > now + 10 min  → schedule normally
-Case 2: now < mint_start <= now + 10 min → send immediately
-Case 3: mint_start <= now < mint_start + 15 min → send immediately
-Case 4: now >= mint_start + 15 min → mark EXPIRED
+The database row (MintOpportunityDB) is the source of truth.  APScheduler jobs
+(persisted in the SQLAlchemy job store) only *trigger* work; every job re-reads
+the row and decides from it, so a stale or duplicated job can never cause a
+second alert.
+
+Lifecycle
+---------
+discovered ──(static rule fails)──────────────▶ REJECTED
+     │──(found after start - 15m)─────────────▶ MISSED   (never sent late)
+     ▼
+ SCHEDULED ──(start - 15m, claim)─▶ SENDING ──(re-check fails)─▶ REJECTED
+     ▲                                  │──(start moved)──▶ SCHEDULED (rescheduled)
+     │                                  ▼
+     └──(start moved)── NOTIFIED ──(start + 10m)──▶ DELETED
 """
 from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Callable, Optional
+
+from sqlalchemy import func, select, update
+
+from app import rules
+from app.config import Settings
+from app.database.models import MintOpportunityDB, NotificationDB
+from app.database.repository import NotificationRepository, _mint_to_db
+from app.filters.mint_filter import FilterConfig, MintFilter
+from app.models.mint import MintOpportunity, MintStatus
+from app.providers.base import RawDrop, RawDropStage
+from app.utils.time import ensure_utc, utcnow
 
 if TYPE_CHECKING:
     from app.monitor.monitor import MonitorHealth
-
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.config import Settings
-from app.database.models import MintOpportunityDB, NotificationDB
-from app.database.repository import MintRepository, NotificationRepository
-from app.filters.mint_filter import FilterConfig, MintFilter
-from app.models.mint import MintOpportunity, MintStatus
-from app.monitor.scheduler import MintScheduler
-from app.providers.base import RawDrop, RawDropStage
-from app.providers.opensea import OpenSeaProvider
-from app.services.notification_service import TelegramNotificationService
-from app.utils.time import delete_time, notification_time, utcnow
+    from app.monitor.scheduler import MintScheduler
 
 log = logging.getLogger(__name__)
 
+# Tolerance for a job firing marginally early (clock jitter).
+_EARLY_TOLERANCE = timedelta(seconds=5)
 
-class MintProcessor:
-    """
-    Processes a single (drop, stage) pair through the full pipeline.
+ACTIVE_UNSENT = (MintStatus.SCHEDULED.value, MintStatus.SENDING.value)
+ACTIVE_SENT = (MintStatus.NOTIFIED.value, MintStatus.DELETE_PENDING.value)
 
-    Parameters
-    ----------
-    settings : Settings
-        Application configuration.
-    provider : OpenSeaProvider
-        API provider (already initialised).
-    session : AsyncSession
-        Active database session (caller manages transaction).
-    scheduler : MintScheduler
-        APScheduler wrapper for persistent jobs.
-    notifier : TelegramNotificationService
-        Telegram bot wrapper.
-    eth_price_usd : Decimal
-        Current ETH/USD price (fetched once per polling cycle).
-    """
+
+def alert_time(start: datetime) -> datetime:
+    return ensure_utc(start) - rules.ALERT_BEFORE_START
+
+
+def deletion_time(start: datetime) -> datetime:
+    return ensure_utc(start) + rules.DELETE_AFTER_START
+
+
+class AlertService:
+    """Owns the alert lifecycle. One instance per process (see set_alert_service)."""
 
     def __init__(
         self,
         settings: Settings,
-        provider: OpenSeaProvider,
-        session: AsyncSession,
-        scheduler: MintScheduler,
-        notifier: TelegramNotificationService,
-        eth_price_usd: Decimal,
-        health: Optional[MonitorHealth] = None,
+        provider,
+        notifier,
+        scheduler: "MintScheduler",
+        session_factory=None,
+        health: Optional["MonitorHealth"] = None,
+        clock: Callable[[], datetime] = utcnow,
     ) -> None:
         self._settings = settings
         self._provider = provider
-        self._session = session
-        self._scheduler = scheduler
         self._notifier = notifier
-        self._eth_price_usd = eth_price_usd
+        self._scheduler = scheduler
+        self._session_factory = session_factory
         self._health = health
+        self._clock = clock
 
-        self._filter = MintFilter(
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _factory(self):
+        if self._session_factory is None:
+            from app.database.database import get_session_factory
+            return get_session_factory()
+        return self._session_factory
+
+    def _now(self) -> datetime:
+        return ensure_utc(self._clock())
+
+    def _filter(self) -> MintFilter:
+        s = self._settings
+        return MintFilter(
             FilterConfig(
-                min_mint_price_usd=settings.min_mint_price_usd,
-                max_mint_price_usd=settings.max_mint_price_usd,
-                min_offer_multiplier=settings.min_offer_multiplier,
-                free_mint_min_offer_usd=settings.free_mint_min_offer_usd,
-                min_minted_percentage=settings.min_minted_percentage,
-                allow_sold_out=settings.allow_sold_out,
-                allow_missing_offer=settings.allow_missing_offer,
-                allow_missing_supply=settings.allow_missing_supply,
+                max_mint_price_usd=s.max_mint_price_usd,
+                min_offer_multiplier=s.min_offer_multiplier,
+                min_minted_percentage=s.min_minted_percentage,
+                allow_sold_out=s.allow_sold_out,
             )
         )
 
-    async def process(self, raw: RawDrop, stage: RawDropStage) -> None:
-        """Process a single (drop, stage) pair through the full pipeline."""
-        mint_repo = MintRepository(self._session)
-        notif_repo = NotificationRepository(self._session)
+    def _schedule_send(self, mint_id: str, at: datetime) -> None:
+        self._scheduler.schedule_notification(mint_id=mint_id, run_at=at, send_fn=run_send_job)
 
-        # ── Step 1: Validate raw data ─────────────────────────────────────────
-        if not _validate_raw(raw, stage):
-            return  # [INVALID_DATA] already logged inside
-
-        # ── Step 2: Fetch supply and offer price ──────────────────────────────
-        detailed = await self._provider.get_mint_details(raw.collection_slug)
-        offer_price_usd = await self._provider.get_collection_offer_price(
-            raw.collection_slug,
-            chain=raw.chain,
-            contract_address=raw.contract_address,
+    def _schedule_delete(self, mint_id: str, message_id: int, at: datetime) -> None:
+        self._scheduler.schedule_deletion(
+            mint_id=mint_id, message_id=message_id, run_at=at, delete_fn=run_delete_job
         )
 
-        # Use detailed supply if available.
-        # NOTE: Use explicit `is not None` — the `or` operator would treat 0 as
-        # falsy and silently fall back to the list value, breaking minted_percentage
-        # for new drops that have 0 tokens minted so far.
+    async def _fetch_normalized(
+        self, raw: RawDrop, stage: RawDropStage, eth_price: Optional[Decimal]
+    ) -> MintOpportunity:
+        detailed = await self._provider.get_mint_details(raw.collection_slug)
         if detailed:
             if detailed.total_supply is not None:
                 raw.total_supply = detailed.total_supply
             if detailed.max_supply is not None:
                 raw.max_supply = detailed.max_supply
+        offer = await self._provider.get_collection_offer_price(
+            raw.collection_slug, chain=raw.chain, contract_address=raw.contract_address
+        )
+        return await self._provider.normalize_mint(
+            raw, stage, float(eth_price) if eth_price is not None else None, offer_price_usd=offer
+        )
 
-        # ── Step 3: Normalise ─────────────────────────────────────────────────
+    @staticmethod
+    async def _find(session, mint: MintOpportunity) -> Optional[MintOpportunityDB]:
+        """Dedupe key: (provider, chain, contract, stage uuid) == collection + mint phase."""
+        stmt = select(MintOpportunityDB).where(
+            MintOpportunityDB.provider == mint.provider,
+            MintOpportunityDB.chain == mint.chain,
+            func.lower(MintOpportunityDB.contract_address) == mint.contract_address.lower(),
+            MintOpportunityDB.external_id == mint.external_id,
+        )
+        return (await session.execute(stmt)).scalars().first()
+
+    @staticmethod
+    def _apply_snapshot(rec: MintOpportunityDB, mint: MintOpportunity) -> None:
+        rec.project_name = mint.project_name
+        rec.mint_type = mint.mint_type
+        rec.mint_price_eth = str(mint.mint_price_eth) if mint.mint_price_eth is not None else None
+        rec.mint_price_usd = str(mint.mint_price_usd)
+        rec.offer_price_usd = str(mint.offer_price_usd) if mint.offer_price_usd is not None else None
+        rec.total_supply = mint.total_supply
+        rec.minted_quantity = mint.minted_quantity
+        rec.minted_percentage = str(mint.minted_percentage) if mint.minted_percentage is not None else None
+        rec.mint_end_time = mint.mint_end_time
+        rec.updated_at = utcnow()
+
+    # ── discovery / poll ──────────────────────────────────────────────────────
+
+    async def process(
+        self, raw: RawDrop, stage: RawDropStage, eth_price: Optional[Decimal]
+    ) -> str:
+        """Handle one (drop, stage) seen during a poll. Never sends anything.
+
+        Returns a short outcome string (useful for logs/tests).
+        """
+        if not _validate_raw(raw, stage):
+            return "invalid"
         try:
-            mint = await self._provider.normalize_mint(
-                raw, stage, float(self._eth_price_usd), offer_price_usd=offer_price_usd
-            )
+            mint = await self._fetch_normalized(raw, stage, eth_price)
         except Exception as exc:
-            log.warning(
-                "[INVALID_DATA] external_id=%s chain=%s field=normalise reason=%s",
-                stage.uuid,
-                raw.chain,
-                exc,
-            )
-            return
+            log.warning("[INVALID_DATA] external_id=%s reason=%s", stage.uuid, exc)
+            return "invalid"
 
-        # ── Step 4: Filter ────────────────────────────────────────────────────
-        result = self._filter.evaluate(mint)
-        rejection_reason: Optional[str] = None
-        if not result.passed:
-            log.info(
-                "[MINT_REJECTED] external_id=%s chain=%s rule=%s reason=%s",
-                mint.external_id,
-                mint.chain,
-                result.rule,
-                result.reason,
-            )
-            if self._health:
-                self._health.rejected += 1
-            mint.status = MintStatus.REJECTED
-            rejection_reason = result.reason
+        now = self._now()
+        result = self._filter().evaluate(mint, now)
+        static_fail = not result.passed and not result.is_dynamic_failure
+        start = mint.mint_start_time
+        notify_at = alert_time(start)
 
-            # If manual filtering mode is OFF, discard and save for audit only
-            if not self._settings.notify_all_discovered:
-                try:
-                    db_record, is_new = await mint_repo.save_mint(mint)
-                    if is_new:
-                        await mint_repo.update_status(
-                            db_record.id,
-                            MintStatus.REJECTED,
-                            {"rejection_reason": result.reason},
-                        )
-                        await self._session.commit()
-                except Exception:
-                    await self._session.rollback()
-                return
-        else:
-            log.info(
-                "[MINT_QUALIFIED] external_id=%s project=%r chain=%s price=$%s offer=$%s minted=%s%%",
-                mint.external_id,
-                mint.project_name,
-                mint.chain,
-                mint.mint_price_usd,
-                mint.offer_price_usd,
-                mint.minted_percentage,
-            )
-            if self._health:
-                self._health.qualified += 1
+        async with self._factory()() as session:
+            rec = await self._find(session, mint)
 
-        # ── Step 5: Deduplicate and save ──────────────────────────────────────
-        db_record, is_new = await mint_repo.save_mint(mint)
-        if not is_new:
-            log.info(
-                "[MINT_DUPLICATE] external_id=%s chain=%s",
-                mint.external_id,
-                mint.chain,
-            )
-            await self._session.rollback()
-            return
+            if rec is None:
+                if static_fail:
+                    mint.status = MintStatus.REJECTED
+                    rec = _mint_to_db(mint)
+                    rec.rejection_reason = f"{result.rule}: {result.reason}"
+                    session.add(rec)
+                    await session.commit()
+                    if self._health:
+                        self._health.rejected += 1
+                    log.info("[MINT_REJECTED] external_id=%s %s", mint.external_id, rec.rejection_reason)
+                    return "rejected"
+                if now >= notify_at:
+                    mint.status = MintStatus.MISSED
+                    rec = _mint_to_db(mint)
+                    rec.rejection_reason = "discovered after mint_start - 15m; spec forbids late/discovery alerts"
+                    session.add(rec)
+                    await session.commit()
+                    log.info("[MINT_MISSED] external_id=%s discovered too late", mint.external_id)
+                    return "missed"
+                mint.status = MintStatus.SCHEDULED
+                mint.notification_scheduled_at = notify_at
+                mint.delete_scheduled_at = deletion_time(start)
+                rec = _mint_to_db(mint)
+                rec.rejection_reason = None if result.passed else f"pending re-check: {result.reason}"
+                session.add(rec)
+                await session.commit()
+                self._schedule_send(rec.id, notify_at)
+                if self._health and result.passed:
+                    self._health.qualified += 1
+                return "scheduled"
 
-        if rejection_reason:
-            db_record.rejection_reason = rejection_reason
-            await mint_repo.update_status(
-                db_record.id,
-                MintStatus.REJECTED,
-                {"rejection_reason": rejection_reason},
-            )
-
-        # ── Step 6: Determine timing ──────────────────────────────────────────
-        now = utcnow()
-        mint_start = mint.mint_start_time
-
-        # Calculate safe future deletion time
-        deletion_at: Optional[datetime] = None
-        if self._settings.delete_after_minutes > 0:
-            base_delete = delete_time(mint_start, self._settings.delete_after_minutes) if mint_start else None
-            min_future_delete = now + timedelta(minutes=self._settings.delete_after_minutes)
-            deletion_at = max(base_delete, min_future_delete) if base_delete else min_future_delete
-
-        # ── Step 7: Manual Filtering / Notify All Discovered ──────────────────
-        if self._settings.notify_all_discovered:
-            # Suppress if the mint has already ended (expired)
-            if mint.mint_end_time and utcnow() >= mint.mint_end_time:
+            # ── existing record: refresh, detect start-time change ──────────
+            self._apply_snapshot(rec, mint)
+            old_start = ensure_utc(rec.mint_start_time)
+            start_changed = old_start != start
+            if start_changed:
                 log.info(
-                    "[MINT_EXPIRED] Skipping discovery alert — mint already ended: "
-                    "external_id=%s end_time=%s",
-                    mint.external_id,
-                    mint.mint_end_time.isoformat(),
+                    "[MINT_RESCHEDULE] mint_id=%s start %s -> %s",
+                    rec.id, old_start.isoformat(), start.isoformat(),
                 )
-                await mint_repo.update_status(db_record.id, MintStatus.EXPIRED)
-                await self._session.commit()
-                return
+                rec.mint_start_time = start
 
-            # Suppress if offer price is missing or not strictly greater than mint price
-            # (Only alert when offer_price > mint_price)
-            mint_price = mint.mint_price_usd or Decimal("0")
-            if mint.offer_price_usd is None or mint.offer_price_usd <= mint_price:
-                log.info(
-                    "[MINT_SKIP] Suppressing discovery alert — offer price ($%s) is not greater than mint price ($%s): "
-                    "external_id=%s chain=%s",
-                    mint.offer_price_usd,
-                    mint_price,
-                    mint.external_id,
-                    mint.chain,
+            outcome = "unchanged"
+            if rec.status in ACTIVE_SENT:
+                if start_changed:
+                    del_at = deletion_time(start)
+                    rec.delete_scheduled_at = del_at
+                    await _set_notification_delete_at(session, rec.id, del_at)
+                    await session.commit()
+                    self._schedule_delete(rec.id, rec.notification_message_id or 0, max(del_at, now))
+                    return "deletion_rescheduled"
+                await session.commit()
+                return "already_sent"
+
+            if rec.status in ACTIVE_UNSENT:
+                if static_fail:
+                    rec.status = MintStatus.REJECTED.value
+                    rec.rejection_reason = f"{result.rule}: {result.reason}"
+                    await session.commit()
+                    self._scheduler.cancel_job(f"notify_{rec.id}")
+                    return "rejected"
+                rec.rejection_reason = None if result.passed else f"pending re-check: {result.reason}"
+                if start_changed:
+                    rec.delete_scheduled_at = deletion_time(start)
+                    rec.notification_scheduled_at = notify_at
+                    if now >= notify_at:
+                        rec.status = MintStatus.MISSED.value
+                        rec.rejection_reason = "start time moved inside the 15-minute alert window"
+                        await session.commit()
+                        self._scheduler.cancel_job(f"notify_{rec.id}")
+                        self._scheduler.cancel_job(f"delete_{rec.id}")
+                        return "missed"
+                    await session.commit()
+                    self._schedule_send(rec.id, notify_at)
+                    self._scheduler.cancel_job(f"delete_{rec.id}")
+                    return "rescheduled"
+                await session.commit()
+                return outcome
+
+            # REJECTED / MISSED / EXPIRED / FAILED — may become eligible again
+            # (e.g. minted % rose, or start moved later), but only if an alert
+            # has never been sent for this phase.
+            if (
+                rec.status in (MintStatus.REJECTED.value, MintStatus.MISSED.value)
+                and rec.notification_sent_at is None
+                and not static_fail
+                and now < notify_at
+            ):
+                rec.status = MintStatus.SCHEDULED.value
+                rec.notification_scheduled_at = notify_at
+                rec.delete_scheduled_at = deletion_time(start)
+                rec.rejection_reason = None if result.passed else f"pending re-check: {result.reason}"
+                await session.commit()
+                self._schedule_send(rec.id, notify_at)
+                return "scheduled"
+            await session.commit()
+            return outcome
+
+    # ── send (rule 3) ─────────────────────────────────────────────────────────
+
+    async def send_alert(self, mint_id: str) -> bool:
+        """Fire the single alert for a phase. Returns True only if a message was sent."""
+        now = self._now()
+        async with self._factory()() as session:
+            rec = await session.get(MintOpportunityDB, mint_id)
+            if rec is None or rec.status != MintStatus.SCHEDULED.value:
+                log.info("[ALERT_SKIP] mint_id=%s status=%s", mint_id, rec.status if rec else None)
+                return False
+            start = ensure_utc(rec.mint_start_time)
+            notify_at = alert_time(start)
+
+            if now < notify_at - _EARLY_TOLERANCE:
+                self._schedule_send(mint_id, notify_at)
+                return False
+            if now >= start or now > notify_at + rules.SEND_GRACE:
+                rec.status = MintStatus.MISSED.value
+                rec.rejection_reason = f"alert window missed (now={now.isoformat()})"
+                await session.commit()
+                log.warning("[ALERT_MISSED] mint_id=%s", mint_id)
+                return False
+
+            # Atomic claim: only one job/process can move SCHEDULED -> SENDING.
+            claimed = await session.execute(
+                update(MintOpportunityDB)
+                .where(MintOpportunityDB.id == mint_id, MintOpportunityDB.status == MintStatus.SCHEDULED.value)
+                .values(status=MintStatus.SENDING.value)
+            )
+            await session.commit()
+            if claimed.rowcount != 1:
+                return False
+
+            existing = await NotificationRepository(session).get_all_by_mint_id(mint_id)
+            if existing:
+                rec.status = MintStatus.NOTIFIED.value
+                await session.commit()
+                return False
+
+            # ── re-check every condition with fresh data ────────────────────
+            fresh = await self._recheck(rec)
+            if isinstance(fresh, str):
+                rec.status = MintStatus.REJECTED.value
+                rec.rejection_reason = f"pre-send re-check failed: {fresh}"
+                await session.commit()
+                log.info("[ALERT_BLOCKED] mint_id=%s %s", mint_id, rec.rejection_reason)
+                return False
+            mint = fresh
+            if mint.mint_start_time != start:
+                new_start = mint.mint_start_time
+                rec.mint_start_time = new_start
+                rec.notification_scheduled_at = alert_time(new_start)
+                rec.delete_scheduled_at = deletion_time(new_start)
+                if self._now() < alert_time(new_start):
+                    rec.status = MintStatus.SCHEDULED.value
+                    await session.commit()
+                    self._schedule_send(mint_id, alert_time(new_start))
+                    return False
+                rec.status = MintStatus.MISSED.value
+                rec.rejection_reason = "start time changed at send time"
+                await session.commit()
+                return False
+            if self._now() >= start:
+                rec.status = MintStatus.MISSED.value
+                rec.rejection_reason = "mint started during re-check"
+                await session.commit()
+                return False
+
+            self._apply_snapshot(rec, mint)
+            rec.rejection_reason = None
+            chat_id = self._settings.telegram_group_id
+            topic_id = self._settings.public_mint_topic_id
+            msg_id = await self._notifier.send_to_target(rec, chat_id, topic_id)
+            if not msg_id:
+                rec.status = MintStatus.FAILED.value
+                rec.rejection_reason = "telegram send failed"
+                await session.commit()
+                return False
+
+            del_at = deletion_time(start)
+            session.add(
+                NotificationDB(
+                    id=str(uuid.uuid4()),
+                    mint_id=mint_id,
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    message_thread_id=topic_id,
+                    delete_scheduled_at=del_at,
                 )
-                await mint_repo.update_status(
-                    db_record.id,
-                    MintStatus.REJECTED,
-                    {"rejection_reason": f"offer_price_usd ({mint.offer_price_usd}) <= mint_price_usd ({mint_price})"},
-                )
-                await self._session.commit()
-                return
-
-            log.info(
-                "[MINT_DISCOVERY_ALERT] Sending immediate alert for discovered mint: %s (%s)",
-                db_record.id,
-                db_record.project_name,
             )
-            await self._session.commit()
-            await self._send_now(db_record, deletion_at, notif_repo)
-            return
-
-        # ── Step 8: Standard Late-detection cases ─────────────────────────────
-        notification_at = notification_time(mint_start, self._settings.notification_before_minutes)
-
-        if deletion_at and now >= deletion_at:
-            # Case 4: mint is expired
-            log.info(
-                "[MINT_EXPIRED] external_id=%s mint_started=%s mins_ago=%.1f",
-                mint.external_id,
-                mint_start.isoformat(),
-                (now - mint_start).total_seconds() / 60,
-            )
-            await mint_repo.update_status(db_record.id, MintStatus.EXPIRED)
-            await self._session.commit()
-            return
-
-        # ── Step 9: Schedule or send ──────────────────────────────────────────
-        if now >= notification_at:
-            # Cases 2 & 3: send immediately
-            await self._session.commit()  # Save record first
-            await self._send_now(db_record, deletion_at, notif_repo)
-        else:
-            # Case 1: schedule for later
-            await mint_repo.update_status(
-                db_record.id,
-                MintStatus.SCHEDULED,
-                {
-                    "notification_scheduled_at": notification_at,
-                    "delete_scheduled_at": deletion_at,
-                },
-            )
-            await self._session.commit()
-
-            self._scheduler.schedule_notification(
-                mint_id=db_record.id,
-                run_at=notification_at,
-                send_fn=_run_send_job,
-            )
-
-    # ── Internal helpers ──────────────────────────────────────────────────────
-
-    async def _get_all_broadcast_targets(self, session: AsyncSession) -> list[tuple[int, Optional[int]]]:
-        """Fetch all active destinations: the primary .env target + any registered in DB."""
-        from app.database.repository import TargetRepository
-        targets: list[tuple[int, Optional[int]]] = [
-            (self._settings.telegram_group_id, self._settings.public_mint_topic_id)
-        ]
-        seen = {(self._settings.telegram_group_id, self._settings.public_mint_topic_id)}
-        try:
-            extra = await TargetRepository(session).get_all_active()
-            for t in extra:
-                key = (t.chat_id, t.topic_id)
-                if key not in seen:
-                    seen.add(key)
-                    targets.append(key)
-        except Exception as exc:
-            log.warning("[BROADCAST] Could not load extra targets from DB: %s", exc)
-        return targets
-
-    async def _send_now(
-        self,
-        db_record: MintOpportunityDB,
-        deletion_at: datetime,
-        notif_repo: NotificationRepository,
-    ) -> None:
-        """Send the notification immediately to all broadcast targets (late detection cases 2 & 3)."""
-        targets = await self._get_all_broadcast_targets(self._session)
-        sent_messages: list[tuple[int, int, Optional[int]]] = []
-
-        for chat_id, topic_id in targets:
-            msg_id = await self._notifier.send_to_target(db_record, chat_id, topic_id)
-            if msg_id:
-                sent_messages.append((chat_id, msg_id, topic_id))
-
-        if not sent_messages:
-            await MintRepository(self._session).update_status(
-                db_record.id, MintStatus.FAILED
-            )
-            await self._session.commit()
-            return
+            rec.status = MintStatus.NOTIFIED.value
+            rec.notification_sent_at = utcnow()
+            rec.notification_message_id = msg_id
+            rec.delete_scheduled_at = del_at
+            await session.commit()
 
         if self._health:
-            self._health.notifications_sent += len(sent_messages)
+            self._health.notifications_sent += 1
+        self._schedule_delete(mint_id, msg_id, del_at)
+        log.info("[ALERT_SENT] mint_id=%s message_id=%s delete_at=%s", mint_id, msg_id, del_at.isoformat())
+        return True
 
-        primary_msg_id = sent_messages[0][1]
-        for chat_id, msg_id, topic_id in sent_messages:
-            notif = NotificationDB(
-                id=str(uuid.uuid4()),
-                mint_id=db_record.id,
-                chat_id=chat_id,
-                message_id=msg_id,
-                message_thread_id=topic_id,
-                delete_scheduled_at=deletion_at,
-            )
-            await notif_repo.save_notification(notif)
-
-        await MintRepository(self._session).update_status(
-            db_record.id,
-            MintStatus.NOTIFIED,
-            {
-                "notification_sent_at": utcnow(),
-                "notification_message_id": primary_msg_id,
-                "delete_scheduled_at": deletion_at,
-            },
-        )
-        await self._session.commit()
-
-        # Schedule deletion
-        if deletion_at:
-            self._scheduler.schedule_deletion(
-                mint_id=db_record.id,
-                message_id=primary_msg_id,
-                run_at=deletion_at,
-                delete_fn=_run_delete_job,
-            )
-
-    # _send_scheduled and _delete_scheduled have been promoted to module-level
-    # functions (_run_send_job / _run_delete_job) so APScheduler can pickle them.
-
-
-
-
-# ---------------------------------------------------------------------------
-# Module-level APScheduler job functions
-# ---------------------------------------------------------------------------
-# These MUST be module-level (not bound methods) so APScheduler's SQLAlchemy
-# job store can pickle them. They only accept primitive args (str / int) and
-# reconstruct every dependency internally via get_settings() / get_session_factory().
-
-
-async def _run_send_job(mint_id: str) -> None:
-    """APScheduler callback: send notification for a scheduled mint."""
-    from app.database.database import get_session_factory
-    from app.database.repository import TargetRepository
-    from app.config import get_settings
-    from sqlalchemy import select
-
-    settings = get_settings()
-    from telegram import Bot
-    bot = Bot(token=settings.telegram_bot_token)
-    notifier = TelegramNotificationService(
-        bot=bot,
-        chat_id=settings.telegram_group_id,
-        topic_id=settings.public_mint_topic_id,
-    )
-    factory = get_session_factory()
-
-    async with factory() as session:
-        result = await session.execute(
-            select(MintOpportunityDB).where(MintOpportunityDB.id == mint_id)
-        )
-        db_record = result.scalar_one_or_none()
-        if db_record is None:
-            log.error("[SCHEDULER] Mint not found for send job: %s", mint_id)
-            return
-
-        if db_record.status not in (MintStatus.SCHEDULED.value, MintStatus.VALIDATED.value):
-            log.info(
-                "[SCHEDULER] Skipping send — status=%s mint_id=%s",
-                db_record.status,
-                mint_id,
-            )
-            return
-
-        # Collect broadcast targets
-        targets: list[tuple[int, Optional[int]]] = [
-            (settings.telegram_group_id, settings.public_mint_topic_id)
-        ]
+    async def _recheck(self, rec: MintOpportunityDB):
+        """Return a fresh MintOpportunity that passes every rule, or a reason string."""
         try:
-            extra_targets = await TargetRepository(session).get_all_active()
-            seen = {(settings.telegram_group_id, settings.public_mint_topic_id)}
-            for t in extra_targets:
-                key = (t.chat_id, t.topic_id)
-                if key not in seen:
-                    targets.append(key)
-                    seen.add(key)
-        except Exception:
-            pass
-
-        sent_messages: list[tuple[int, int, Optional[int]]] = []
-        for chat_id, topic_id in targets:
-            msg_id = await notifier.send_to_target(db_record, chat_id, topic_id)
-            if msg_id:
-                sent_messages.append((chat_id, msg_id, topic_id))
-
-        if not sent_messages:
-            await MintRepository(session).update_status(mint_id, MintStatus.FAILED)
-            await session.commit()
-            return
-
-        deletion_at = db_record.delete_scheduled_at
-        notif_repo = NotificationRepository(session)
-        primary_msg_id = sent_messages[0][1]
-
-        for chat_id, msg_id, topic_id in sent_messages:
-            notif = NotificationDB(
-                id=str(uuid.uuid4()),
-                mint_id=mint_id,
-                chat_id=chat_id,
-                message_id=msg_id,
-                message_thread_id=topic_id,
-                delete_scheduled_at=deletion_at,
+            details = await self._provider.get_mint_details(rec.collection_slug)
+        except Exception as exc:  # pragma: no cover - provider already swallows
+            return f"could not refetch drop: {exc}"
+        if details is None:
+            return "could not refetch drop to confirm"
+        stage = None
+        for s in [details.next_stage, details.active_stage, *(details.stages or [])]:
+            if s is not None and s.uuid == rec.external_id:
+                stage = s
+                break
+        if stage is None:
+            return "mint phase no longer listed by provider"
+        if not _validate_raw(details, stage):
+            return "refetched data invalid"
+        eth = await self._provider.get_reliable_eth_price_usd()
+        offer = await self._provider.get_collection_offer_price(
+            details.collection_slug, chain=details.chain, contract_address=details.contract_address
+        )
+        try:
+            mint = await self._provider.normalize_mint(
+                details, stage, float(eth) if eth is not None else None, offer_price_usd=offer
             )
-            await notif_repo.save_notification(notif)
+        except Exception as exc:
+            return f"normalise failed: {exc}"
+        if mint.mint_start_time != ensure_utc(rec.mint_start_time):
+            return mint  # caller reschedules
+        result = self._filter().evaluate(mint, self._now())
+        if not result.passed:
+            return f"{result.rule}: {result.reason}"
+        return mint
 
-        await MintRepository(session).update_status(
-            mint_id,
-            MintStatus.NOTIFIED,
-            {
-                "notification_sent_at": utcnow(),
-                "notification_message_id": primary_msg_id,
-            },
-        )
-        await session.commit()
+    # ── delete (rule 4) ───────────────────────────────────────────────────────
 
-    if deletion_at:
-        from app.monitor.scheduler import MintScheduler
-        from app.config import get_settings as _gs
-        _settings = _gs()
-        sync_url = _settings.database_url.replace("sqlite+aiosqlite", "sqlite")
-        sched = MintScheduler(sync_url)
-        sched.schedule_deletion(
-            mint_id=mint_id,
-            message_id=primary_msg_id,
-            run_at=deletion_at,
-            delete_fn=_run_delete_job,
-        )
+    async def delete_alert(self, mint_id: str) -> bool:
+        now = self._now()
+        async with self._factory()() as session:
+            rec = await session.get(MintOpportunityDB, mint_id)
+            if rec is None:
+                return False
+            if rec.status not in ACTIVE_SENT:
+                return False
+            del_at = deletion_time(rec.mint_start_time)
+            if now < del_at - _EARLY_TOLERANCE:
+                # Start was postponed after this job was queued.
+                self._schedule_delete(mint_id, rec.notification_message_id or 0, del_at)
+                return False
+
+            notifs = await NotificationRepository(session).get_all_by_mint_id(mint_id)
+            all_ok = True
+            for n in notifs:
+                if n.deleted_at is None:
+                    ok = await self._notifier.delete_target_message(n.chat_id, n.message_id, mint_id)
+                    if ok:
+                        n.deleted_at = utcnow()
+                    all_ok = all_ok and ok
+            if not notifs and rec.notification_message_id:
+                all_ok = await self._notifier.delete_target_message(
+                    self._settings.telegram_group_id, rec.notification_message_id, mint_id
+                )
+            if all_ok:
+                rec.status = MintStatus.DELETED.value
+                rec.deleted_at = utcnow()
+            else:
+                rec.status = MintStatus.FAILED.value
+                rec.rejection_reason = "telegram delete failed"
+            await session.commit()
+        if all_ok and self._health:
+            self._health.deletions += 1
+        return all_ok
+
+    # ── restart recovery (rule 5) ─────────────────────────────────────────────
+
+    async def recover(self) -> dict:
+        """Re-arm every pending job from the DB and run overdue deletions now."""
+        now = self._now()
+        stats = {"alerts_rescheduled": 0, "alerts_missed": 0, "deletions_rescheduled": 0, "deleted_overdue": 0}
+        async with self._factory()() as session:
+            rows = (
+                await session.execute(
+                    select(MintOpportunityDB).where(
+                        MintOpportunityDB.status.in_(ACTIVE_UNSENT + ACTIVE_SENT)
+                    )
+                )
+            ).scalars().all()
+            overdue: list[str] = []
+            for rec in rows:
+                start = ensure_utc(rec.mint_start_time)
+                if rec.status in ACTIVE_UNSENT:
+                    notifs = await NotificationRepository(session).get_all_by_mint_id(rec.id)
+                    if notifs:  # crashed after sending but before marking NOTIFIED
+                        rec.status = MintStatus.NOTIFIED.value
+                        rec.notification_message_id = notifs[0].message_id
+                    else:
+                        notify_at = alert_time(start)
+                        rec.status = MintStatus.SCHEDULED.value
+                        if now < notify_at:
+                            self._schedule_send(rec.id, notify_at)
+                            stats["alerts_rescheduled"] += 1
+                            continue
+                        if now <= notify_at + rules.SEND_GRACE and now < start:
+                            self._schedule_send(rec.id, now)
+                            stats["alerts_rescheduled"] += 1
+                            continue
+                        rec.status = MintStatus.MISSED.value
+                        rec.rejection_reason = "alert window passed while bot was offline"
+                        self._scheduler.cancel_job(f"notify_{rec.id}")
+                        stats["alerts_missed"] += 1
+                        continue
+                # sent: delete at start + 10 (recomputed from start, not from stored value)
+                del_at = deletion_time(start)
+                rec.delete_scheduled_at = del_at
+                if now >= del_at:
+                    overdue.append(rec.id)
+                else:
+                    self._schedule_delete(rec.id, rec.notification_message_id or 0, del_at)
+                    stats["deletions_rescheduled"] += 1
+            await session.commit()
+        for mint_id in overdue:
+            self._scheduler.cancel_job(f"delete_{mint_id}")
+            if await self.delete_alert(mint_id):
+                stats["deleted_overdue"] += 1
+        log.info("[RECOVERY] %s", stats)
+        return stats
 
 
-async def _run_delete_job(mint_id: str, message_id: int) -> None:
-    """APScheduler callback: delete a previously sent Telegram notification."""
-    from app.database.database import get_session_factory
-    from app.config import get_settings
-
-    settings = get_settings()
-    from telegram import Bot
-    bot = Bot(token=settings.telegram_bot_token)
-    notifier = TelegramNotificationService(
-        bot=bot,
-        chat_id=settings.telegram_group_id,
-        topic_id=settings.public_mint_topic_id,
+async def _set_notification_delete_at(session, mint_id: str, del_at: datetime) -> None:
+    await session.execute(
+        update(NotificationDB)
+        .where(NotificationDB.mint_id == mint_id, NotificationDB.deleted_at.is_(None))
+        .values(delete_scheduled_at=del_at)
     )
-    factory = get_session_factory()
 
-    async with factory() as session:
-        notif_repo = NotificationRepository(session)
-        notifs = await notif_repo.get_all_by_mint_id(mint_id)
-        deleted_any = False
-        for notif in notifs:
-            if notif.deleted_at is None:
-                ok = await notifier.delete_target_message(notif.chat_id, notif.message_id, mint_id)
-                if ok:
-                    notif.deleted_at = utcnow()
-                    deleted_any = True
 
-        if not notifs:
-            deleted_any = await notifier.delete_mint_alert(message_id, mint_id)
+# ---------------------------------------------------------------------------
+# Module-level APScheduler job entry points (picklable by reference).
+# ---------------------------------------------------------------------------
 
-        status = MintStatus.DELETED if deleted_any else MintStatus.FAILED
-        extra = {"deleted_at": utcnow()} if deleted_any else {}
-        await MintRepository(session).update_status(mint_id, status, extra)
-        await session.commit()
+_service: Optional[AlertService] = None
+
+
+def set_alert_service(service: Optional[AlertService]) -> None:
+    global _service
+    _service = service
+
+
+def get_alert_service() -> Optional[AlertService]:
+    return _service
+
+
+async def run_send_job(mint_id: str) -> None:
+    if _service is None:
+        log.error("[SCHEDULER] send job for %s fired before AlertService was ready", mint_id)
+        return
+    await _service.send_alert(mint_id)
+
+
+async def run_delete_job(mint_id: str, message_id: int = 0) -> None:
+    if _service is None:
+        log.error("[SCHEDULER] delete job for %s fired before AlertService was ready", mint_id)
+        return
+    await _service.delete_alert(mint_id)
+
+
+# Backwards-compatible names: jobs already persisted by older versions
+# reference these symbols in the APScheduler job store.
+_run_send_job = run_send_job
+_run_delete_job = run_delete_job
 
 
 # ---------------------------------------------------------------------------
@@ -515,13 +561,8 @@ async def _run_delete_job(mint_id: str, message_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 def _validate_raw(raw: RawDrop, stage: RawDropStage) -> bool:
-    """
-    Validate that the raw drop and stage contain the minimum required fields.
-
-    Logs [INVALID_DATA] and returns False if any required field is missing.
-    """
+    """Minimum required fields, and a parseable timezone-aware start time."""
     eid = stage.uuid if stage else "?"
-
     checks = [
         (raw.collection_slug, "collection_slug"),
         (raw.contract_address, "contract_address"),
@@ -535,30 +576,15 @@ def _validate_raw(raw: RawDrop, stage: RawDropStage) -> bool:
             (stage.stage_type, "stage.stage_type"),
             (stage.start_time, "stage.start_time"),
         ]
-
     for value, field_name in checks:
         if not value:
-            log.warning(
-                "[INVALID_DATA] external_id=%s chain=%s field=%s reason=missing_or_empty",
-                eid,
-                raw.chain if raw else "?",
-                field_name,
-            )
+            log.warning("[INVALID_DATA] external_id=%s field=%s reason=missing_or_empty", eid, field_name)
             return False
-
-    # Validate start_time parses
     try:
-        from app.providers.opensea import _parse_dt
-        dt = _parse_dt(stage.start_time)
+        dt = datetime.fromisoformat(stage.start_time.replace("Z", "+00:00"))
         if dt.tzinfo is None:
-            raise ValueError("start_time must be timezone-aware")
+            raise ValueError("start_time must carry a timezone (unconfirmed otherwise)")
     except Exception as exc:
-        log.warning(
-            "[INVALID_DATA] external_id=%s chain=%s field=start_time reason=%s",
-            eid,
-            raw.chain,
-            exc,
-        )
+        log.warning("[INVALID_DATA] external_id=%s field=start_time reason=%s", eid, exc)
         return False
-
     return True

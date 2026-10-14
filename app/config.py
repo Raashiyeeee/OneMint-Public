@@ -55,38 +55,30 @@ class Settings(BaseSettings):
     )
 
     # ─── Filtering ─────────────────────────────────────────────────────────────
-    min_mint_price_usd: Decimal = Field(default=Decimal("0"), description="Minimum mint price in USD")
-    max_mint_price_usd: Decimal = Field(default=Decimal("20"), description="Maximum mint price in USD")
-    min_offer_multiplier: Decimal = Field(default=Decimal("1.5"), description="Min offer/mint-price ratio for paid mints")
-    free_mint_min_offer_usd: Decimal = Field(default=Decimal("5"), description="Min offer price for free mints")
-    min_minted_percentage: Decimal = Field(default=Decimal("70"), description="Minimum minted percentage required")
+    # Spec rules (app/rules.py) are the floor: these may be set STRICTER, never
+    # looser. Loose values are rejected at startup.
+    max_mint_price_usd: Decimal = Field(
+        default=Decimal("13"), ge=0, le=13, description="Maximum mint price in USD (spec: <= $13)"
+    )
+    min_offer_multiplier: Decimal = Field(
+        default=Decimal("1.40"), ge=Decimal("1.40"), description="Min offer/mint-price ratio (spec: >= 1.40)"
+    )
+    min_minted_percentage: Decimal = Field(
+        default=Decimal("70"), ge=70, le=100, description="Minimum minted percentage (spec: >= 70)"
+    )
     allow_sold_out: bool = Field(default=False, description="Allow 100% sold-out mints")
-    duplicate_listings: bool = Field(default=False, description="Allow duplicate listings")
-    # When True, mints with no floor/offer price from the API pass through with a
-    # warning instead of being hard-rejected (prevents silent drops like Robinhood NFTs)
-    allow_missing_offer: bool = Field(
-        default=True,
-        description="Pass mints through when floor/offer price is unavailable from API",
-    )
-    # When True, mints with no supply data from the API pass through with a warning
-    allow_missing_supply: bool = Field(
-        default=True,
-        description="Pass mints through when minted supply data is unavailable from API",
-    )
-    # When True, sends notifications for ALL discovered mints immediately
-    # as each is discovered in the DB, allowing manual filtering.
-    notify_all_discovered: bool = Field(
-        default=True,
-        description="Send notifications for all discovered mints immediately for manual filtering",
-    )
 
-    # ─── Scheduling ────────────────────────────────────────────────────────────
-    notification_before_minutes: int = Field(
-        default=10, description="Minutes before mint start to send notification"
-    )
-    delete_after_minutes: int = Field(
-        default=15, description="Minutes after mint start to delete notification"
-    )
+    # Timing is fixed by the spec and intentionally not configurable:
+    # alert at mint_start - 15 min, delete at mint_start + 10 min.
+    @property
+    def notification_before_minutes(self) -> int:
+        from app.rules import ALERT_BEFORE_START
+        return int(ALERT_BEFORE_START.total_seconds() // 60)
+
+    @property
+    def delete_after_minutes(self) -> int:
+        from app.rules import DELETE_AFTER_START
+        return int(DELETE_AFTER_START.total_seconds() // 60)
 
     # ─── ETH price ─────────────────────────────────────────────────────────────
     eth_price_usd: Optional[Decimal] = Field(

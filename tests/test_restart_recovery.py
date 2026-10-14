@@ -56,36 +56,6 @@ def make_scheduled_record(start_offset_minutes: int = 5) -> MintOpportunityDB:
     )
 
 
-def test_recovery_case2_notification_overdue():
-    """
-    Recovery: Bot crashed before sending notification.
-    Mint starts in 5 minutes — notification was due 5 minutes ago.
-    Expected: send immediately.
-    """
-    start = utcnow() + timedelta(minutes=5)
-    notif_at = notification_time(start, before_minutes=10)
-    del_at = delete_time(start, after_minutes=15)
-    now = utcnow()
-
-    assert notif_at < now    # Overdue
-    assert del_at > now      # Deletion still in future
-    # Action: send immediately, schedule deletion at del_at
-
-
-def test_recovery_case3_mint_started_within_window():
-    """
-    Recovery: Bot restarted after mint started but within 15-min window.
-    Mint started 5 minutes ago.
-    Expected: send immediately, schedule deletion at start+15.
-    """
-    start = utcnow() - timedelta(minutes=5)
-    del_at = delete_time(start, after_minutes=15)
-    now = utcnow()
-
-    assert del_at > now       # Still 10 minutes until deletion
-    # Action: send immediately, schedule deletion at del_at
-
-
 def test_recovery_case4_expired():
     """
     Recovery: Bot restarted 20 minutes after mint started.

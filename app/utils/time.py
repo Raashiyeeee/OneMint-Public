@@ -16,7 +16,7 @@ def ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
         return None
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
-    return dt
+    return dt.astimezone(timezone.utc)
 
 
 def minutes_until(dt: datetime) -> float:
@@ -24,14 +24,17 @@ def minutes_until(dt: datetime) -> float:
     return (dt - utcnow()).total_seconds() / 60.0
 
 
-def notification_time(mint_start: datetime, before_minutes: int = 10) -> datetime:
-    """Return the time the notification should be sent."""
-    return mint_start - timedelta(minutes=before_minutes)
+def notification_time(mint_start: datetime, before_minutes: int = 15) -> datetime:
+    """Return the time the alert should be sent (spec: mint_start - 15 min)."""
+    return ensure_utc(mint_start) - timedelta(minutes=before_minutes)
 
 
-def delete_time(mint_start: datetime, after_minutes: int = 15) -> datetime:
-    """Return the time the notification should be deleted."""
-    return mint_start + timedelta(minutes=after_minutes)
+def delete_time(mint_start: datetime, after_minutes: int = 10) -> datetime:
+    """Return the time the alert should be deleted (spec: mint_start + 10 min).
+
+    Always anchored to mint start, never to when the alert was sent.
+    """
+    return ensure_utc(mint_start) + timedelta(minutes=after_minutes)
 
 
 def format_time_remaining(minutes: float) -> str:

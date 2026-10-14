@@ -46,15 +46,18 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 FILTER_FIELDS = {
-    "max_mint_price_usd": ("MAX_MINT_PRICE_USD", "Maximum mint price in USD (0-20)"),
-    "min_offer_multiplier": ("MIN_OFFER_MULTIPLIER", "Offer/price ratio for paid mints (e.g. 1.5)"),
-    "free_mint_min_offer_usd": ("FREE_MINT_MIN_OFFER_USD", "Min offer for free mints (e.g. 5)"),
-    "min_minted_percentage": ("MIN_MINTED_PERCENTAGE", "Min minted % to qualify (0-100)"),
+    "max_mint_price_usd": ("MAX_MINT_PRICE_USD", "Maximum mint price in USD (0-13; spec cap is $13)"),
+    "min_offer_multiplier": ("MIN_OFFER_MULTIPLIER", "Offer/price ratio (>= 1.40; spec floor)"),
+    "min_minted_percentage": ("MIN_MINTED_PERCENTAGE", "Min minted % to qualify (70-100; spec floor)"),
     "allow_sold_out": ("ALLOW_SOLD_OUT", "Allow 100% sold-out mints (true/false)"),
-    "notify_all_discovered": ("NOTIFY_ALL_DISCOVERED", "Notify all discovered mints immediately for manual filtering (true/false)"),
-    "notification_before_minutes": ("NOTIFICATION_BEFORE_MINUTES", "Minutes before mint start to alert (e.g. 10)"),
-    "delete_after_minutes": ("DELETE_AFTER_MINUTES", "Minutes after mint start to delete notification (e.g. 15)"),
     "poll_interval_seconds": ("POLL_INTERVAL_SECONDS", "Fetching/polling interval in seconds (30-86400)"),
+}
+
+# Spec bounds: runtime changes may tighten rules but never loosen them.
+_FILTER_BOUNDS = {
+    "max_mint_price_usd": (Decimal("0"), Decimal("13")),
+    "min_offer_multiplier": (Decimal("1.40"), None),
+    "min_minted_percentage": (Decimal("70"), Decimal("100")),
 }
 
 DB_ADMIN_KEY = "admin_ids_runtime"
@@ -367,21 +370,17 @@ async def cmd_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "",
         f"⏱ Fetch Interval:       <b>{interval_str}</b>",
         f"💵 Max Mint Price:      <b>${settings.max_mint_price_usd}</b>",
-        f"📊 Offer Multiplier:    <b>{settings.min_offer_multiplier}×</b> (paid mints)",
-        f"🆓 Free Mint Min Offer: <b>${settings.free_mint_min_offer_usd}</b>",
+        f"📊 Offer Multiplier:    <b>{settings.min_offer_multiplier}×</b> (gross, before fees)",
         f"🔥 Min Minted Supply:   <b>{settings.min_minted_percentage}%</b>",
         f"🛒 Allow Sold Out:      <b>{'Yes' if settings.allow_sold_out else 'No'}</b>",
-        f"🔍 Notify All Discovered:<b>{'Yes (manual mode)' if getattr(settings, 'notify_all_discovered', True) else 'No (strict auto-filter)'}</b>",
-        f"⏰ Notify Before:       <b>{settings.notification_before_minutes} min</b>",
-        f"🗑 Delete After:        <b>{settings.delete_after_minutes} min</b>",
+        f"⏰ Alert:               <b>mint start − {settings.notification_before_minutes} min</b> (fixed)",
+        f"🗑 Delete:              <b>mint start + {settings.delete_after_minutes} min</b> (fixed)",
         "",
         "Commands to change settings:",
         "• <code>/setinterval &lt;time&gt;</code> (e.g. <code>30m</code>, <code>1h</code>, <code>45s</code>)",
         "• <code>/setfilter &lt;key&gt; &lt;value&gt;</code>",
-        "  Keys: <code>notify_all_discovered</code>, <code>max_mint_price_usd</code>,",
-        "        <code>min_offer_multiplier</code>, <code>free_mint_min_offer_usd</code>,",
-        "        <code>min_minted_percentage</code>, <code>allow_sold_out</code>,",
-        "        <code>delete_after_minutes</code>",
+        "  Keys: <code>max_mint_price_usd</code>, <code>min_offer_multiplier</code>,",
+        "        <code>min_minted_percentage</code>, <code>allow_sold_out</code>",
     ]
     await (update.effective_message or update.message).reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -448,23 +447,24 @@ async def cmd_setfilter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
-    if key in ("allow_sold_out", "notify_all_discovered"):
+    if key == "allow_sold_out":
         value = raw_value.strip().lower() in ("true", "1", "yes", "on")
-    elif key in ("poll_interval_seconds", "delete_after_minutes", "notification_before_minutes"):
+    elif key == "poll_interval_seconds":
         try:
             value = int(raw_value)
-            if key == "poll_interval_seconds" and not (30 <= value <= 86400):
+            if not (30 <= value <= 86400):
                 raise ValueError("Must be between 30 and 86400 seconds")
-            if key in ("delete_after_minutes", "notification_before_minutes") and value < 0:
-                raise ValueError("Must be non-negative")
         except ValueError as exc:
             await (update.effective_message or update.message).reply_text(f"❌ Invalid value: {exc}")
             return
     else:
         try:
             value = Decimal(raw_value)
-            if value < 0:
-                raise ValueError("Value must be non-negative")
+            lo, hi = _FILTER_BOUNDS.get(key, (Decimal("0"), None))
+            if value < lo or (hi is not None and value > hi):
+                raise ValueError(
+                    f"Must be between {lo} and {hi if hi is not None else '∞'} (spec limit)"
+                )
         except (InvalidOperation, ValueError) as exc:
             await (update.effective_message or update.message).reply_text(f"❌ Invalid value: {exc}")
             return
@@ -608,84 +608,15 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── /sendtoday ─────────────────────────────────────────────────────────────────
 
 async def cmd_sendtoday(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /sendtoday — send alerts for all unnotified mints discovered today (admin only)."""
+    """/sendtoday is disabled: the spec allows exactly one alert per mint phase,
+    sent only at mint_start − 15 min, never on discovery or on demand."""
     if not _admin_check(update, context):
         await _reject_unauthorized(update, context)
         return
-
-    monitor: MintMonitor | None = context.bot_data.get("monitor")
-    settings: Settings | None = context.bot_data.get("settings")
-    if not monitor or not settings:
-        await (update.effective_message or update.message).reply_text("❌ Monitor or settings not available.")
-        return
-
-    try:
-        from datetime import datetime, timezone, timedelta
-        from decimal import Decimal
-        from sqlalchemy import select
-        from app.database.database import get_session_factory
-        from app.database.models import MintOpportunityDB
-        from app.database.repository import NotificationRepository
-        from app.monitor.processor import MintProcessor
-        from app.utils.time import delete_time
-
-        factory = get_session_factory()
-        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-
-        async with factory() as session:
-            result = await session.execute(
-                select(MintOpportunityDB).where(
-                    MintOpportunityDB.created_at >= today_start,
-                    MintOpportunityDB.notification_sent_at.is_(None),
-                ).order_by(MintOpportunityDB.created_at.asc())
-            )
-            records = list(result.scalars().all())
-
-        if not records:
-            await (update.effective_message or update.message).reply_text(
-                "ℹ️ All mints discovered today have already been notified!",
-                parse_mode="HTML",
-            )
-            return
-
-        sent_count = 0
-        now = datetime.now(timezone.utc)
-        for record in records:
-            try:
-                async with factory() as session:
-                    mint_start = record.mint_start_time
-                    if mint_start and mint_start.tzinfo is None:
-                        mint_start = mint_start.replace(tzinfo=timezone.utc)
-
-                    if settings.delete_after_minutes > 0:
-                        base_delete = delete_time(mint_start, settings.delete_after_minutes) if mint_start else None
-                        min_future_delete = now + timedelta(minutes=settings.delete_after_minutes)
-                        deletion_at = max(base_delete, min_future_delete) if base_delete else min_future_delete
-                    else:
-                        deletion_at = None
-
-                    notif_repo = NotificationRepository(session)
-                    processor = MintProcessor(
-                        settings=settings,
-                        provider=monitor._provider,
-                        session=session,
-                        scheduler=monitor._scheduler,
-                        notifier=monitor._notifier,
-                        eth_price_usd=monitor.last_eth_price or Decimal("0"),
-                        health=monitor.health,
-                    )
-                    await processor._send_now(record, deletion_at, notif_repo)
-                    sent_count += 1
-            except Exception as exc:
-                log.error("[BOT] Failed to send today's mint %s: %s", record.id, exc)
-
-        await (update.effective_message or update.message).reply_text(
-            f"✅ Sent alerts for <b>{sent_count}</b> unnotified mint(s) from today to the broadcast topic!",
-            parse_mode="HTML",
-        )
-    except Exception as exc:
-        log.error("[BOT] cmd_sendtoday error: %s", exc)
-        await (update.effective_message or update.message).reply_text(f"❌ Error sending alerts: {exc}")
+    await (update.effective_message or update.message).reply_text(
+        "ℹ️ /sendtoday is disabled. Alerts are sent automatically, once, "
+        "15 minutes before each qualifying public mint starts."
+    )
 
 
 # ── /recent ────────────────────────────────────────────────────────────────────
@@ -973,12 +904,8 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         (settings.telegram_group_id, settings.public_mint_topic_id, "Primary (.env)")
     ]
     seen = {(settings.telegram_group_id, settings.public_mint_topic_id)}
-    for t in extra_targets:
-        key = (t.chat_id, t.topic_id)
-        if key not in seen:
-            seen.add(key)
-            name = t.label or f"Chat {t.chat_id}"
-            targets.append((t.chat_id, t.topic_id, name))
+    # Alerts (and therefore test alerts) go only to the configured group/topic.
+    del extra_targets, seen
 
     results = []
     for chat_id, topic_id, label in targets:

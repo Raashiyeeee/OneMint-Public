@@ -260,7 +260,8 @@ def _mint_to_db(mint: MintOpportunity) -> MintOpportunityDB:
         notification_message_id=mint.notification_message_id,
         delete_scheduled_at=mint.delete_scheduled_at,
         deleted_at=mint.deleted_at,
-        status=str(mint.status),
+        # str(Enum) is 'MintStatus.X' on Python 3.11+; always store the value.
+        status=mint.status.value if isinstance(mint.status, MintStatus) else str(mint.status),
         detected_at=mint.detected_at,
         created_at=mint.created_at,
         updated_at=mint.updated_at,
