@@ -146,6 +146,8 @@ class NotificationDB(Base):
     chat_id: Mapped[int] = mapped_column(Integer, nullable=False)
     message_id: Mapped[int] = mapped_column(Integer, nullable=False)
     message_thread_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # "discovery" = immediate qualify alert; "reminder" = start - 15m alert
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, default="reminder")
     sent_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )

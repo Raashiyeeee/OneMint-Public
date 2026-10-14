@@ -41,14 +41,19 @@ class TelegramNotificationService:
         self._topic_id = topic_id
 
     async def send_to_target(
-        self, mint: MintOpportunityDB, chat_id: int, topic_id: Optional[int] = None
+        self,
+        mint: MintOpportunityDB,
+        chat_id: int,
+        topic_id: Optional[int] = None,
+        *,
+        kind: str = "reminder",
     ) -> Optional[int]:
         """
         Send a public mint alert to a specific chat/channel and optional topic.
 
         Returns message_id on success, None on failure.
         """
-        text = _format_alert(mint)
+        text = _format_alert(mint, kind=kind)
         try:
             kwargs = {
                 "chat_id": chat_id,
@@ -128,7 +133,7 @@ class TelegramNotificationService:
 # Message formatting
 # ---------------------------------------------------------------------------
 
-def _format_alert(mint: MintOpportunityDB) -> str:
+def _format_alert(mint: MintOpportunityDB, *, kind: str = "reminder") -> str:
     """
     Format a mint alert as Telegram HTML.
 
@@ -158,8 +163,13 @@ def _format_alert(mint: MintOpportunityDB) -> str:
     else:
         starts_in = "Unknown"
 
+    if kind == "discovery":
+        headline = "🚨 <b>QUALIFIED MINT FOUND</b>"
+    else:
+        headline = "🚨 <b>PUBLIC MINT ALERT</b>"
+
     lines = [
-        "🚨 <b>PUBLIC MINT ALERT</b>",
+        headline,
         "",
         f"<b>Project:</b> {project}",
         f"<b>Chain:</b> {chain}",

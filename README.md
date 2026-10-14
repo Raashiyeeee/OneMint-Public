@@ -10,7 +10,7 @@ auto-deleting alerts to a configured Telegram group topic.
 
 - **Monitors 15 chains** via OpenSea v2 API with cursor-based pagination
 - **Filters** public mints only (no whitelist/allowlist), price ≤ $13, offer ≥ 1.40× mint price, minted supply ≥ 70%, confirmed start time
-- **One alert** per mint phase, sent at mint start − 15 minutes after re-checking every rule (never on discovery)
+- **Two alerts** per mint phase: immediate when fully qualified, plus a reminder at mint start − 15 minutes (re-checked before the reminder)
 - **Auto-deletion** at mint start + 10 minutes (rescheduled if the start time changes; recovered after restarts)
 - **Persistent scheduler** (APScheduler + SQLite) — survives server restarts
 - **Restart recovery** — reschedules missed jobs on startup

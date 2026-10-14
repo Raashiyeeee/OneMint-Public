@@ -21,13 +21,15 @@ START = T0 + timedelta(hours=3)  # same UTC day as T0 (12:00 -> 15:00)
 async def test_sendtoday_sends_eligible_now_once_and_blocks_auto_duplicate(env):
     await discover(env, make_stage(START))
     rec = await only_row(env)
+    assert len(env["notifier"].sent) == 1  # discovery on qualify
     env["clock"].now = T0 + timedelta(minutes=5)
     res = await env["svc"].send_today()
     assert [r["sent"] for r in res] == [True]
-    assert env["notifier"].sent == [(GROUP, TOPIC, rec.id)]
+    # discovery + early reminder
+    assert env["notifier"].sent == [(GROUP, TOPIC, rec.id), (GROUP, TOPIC, rec.id)]
     row = await only_row(env)
     assert row.status == MintStatus.NOTIFIED.value and row.notification_sent_at is not None
-    assert len(await notifications(env)) == 1
+    assert len(await notifications(env)) == 2
     # automatic job is cancelled; even if a stale one fires it does not resend
     assert f"notify_{rec.id}" not in env["sched"].jobs
     env["clock"].now = START - timedelta(minutes=15)
@@ -35,7 +37,7 @@ async def test_sendtoday_sends_eligible_now_once_and_blocks_auto_duplicate(env):
     # running /sendtoday again doesn't resend
     res2 = await env["svc"].send_today()
     assert res2[0]["sent"] is False and res2[0]["reason"] == "already alerted"
-    assert len(env["notifier"].sent) == 1
+    assert len(env["notifier"].sent) == 2
 
 
 @pytest.mark.asyncio
@@ -49,8 +51,10 @@ async def test_sendtoday_schedules_deletion_at_start_plus_10(env):
 
 @pytest.mark.asyncio
 async def test_sendtoday_skips_when_fresh_data_fails_and_keeps_auto_schedule(env):
-    await discover(env, make_stage(START))
+    # Pending at discovery (no discovery alert) so we can assert sendtoday sends nothing.
+    await discover(env, make_stage(START), minted="600")
     rec = await only_row(env)
+    env["provider"].drop.total_supply = "800"
     env["provider"].offer = 13.0  # $10 mint needs $14
     res = await env["svc"].send_today()
     assert res[0]["sent"] is False and "RULE2_OFFER_RATIO" in res[0]["reason"]
@@ -63,9 +67,11 @@ async def test_sendtoday_skips_when_fresh_data_fails_and_keeps_auto_schedule(env
 async def test_sendtoday_ignores_other_days_and_started_mints(env):
     await discover(env, make_stage(T0 + timedelta(days=1, hours=1), uid="tomorrow"))
     await discover(env, make_stage(START, uid="today"))
+    discovery_count = len(env["notifier"].sent)  # both were qualified at discovery
     env["clock"].now = START + timedelta(minutes=1)  # today's mint has started
     res = await env["svc"].send_today()
-    assert res == [] and env["notifier"].sent == []
+    assert res == []
+    assert len(env["notifier"].sent) == discovery_count  # no extra reminder from /sendtoday
 
 
 @pytest.mark.asyncio

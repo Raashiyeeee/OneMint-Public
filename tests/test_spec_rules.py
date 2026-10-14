@@ -61,12 +61,14 @@ class FakeScheduler:
 class FakeNotifier:
     def __init__(self) -> None:
         self.sent: list[tuple[int, Optional[int], str]] = []
+        self.kinds: list[str] = []
         self.deleted: list[tuple[int, int]] = []
         self._next = 100
 
-    async def send_to_target(self, rec, chat_id, topic_id=None):
+    async def send_to_target(self, rec, chat_id, topic_id=None, *, kind: str = "reminder"):
         self._next += 1
         self.sent.append((chat_id, topic_id, rec.id))
+        self.kinds.append(kind)
         return self._next
 
     async def delete_target_message(self, chat_id, message_id, mint_id):
@@ -292,26 +294,29 @@ def test_rule2_uses_gross_offer_no_fee_deduction():
     assert ev(mint_price_usd=Decimal("5"), offer_price_usd=Decimal("7")).passed
 
 
-# ─── Rule 3: one alert at start - 15m, re-checked, right destination ──────────
+# ─── Rule 3: discovery alert + reminder at start - 15m ────────────────────────
 
 @pytest.mark.asyncio
-async def test_rule3_discovery_never_sends_and_schedules_at_minus_15(env):
+async def test_rule3_discovery_sends_immediately_and_schedules_minus_15(env):
     assert await discover(env, make_stage(START)) == "scheduled"
-    assert env["notifier"].sent == []
     rec = await only_row(env)
+    assert env["notifier"].sent == [(GROUP, TOPIC, rec.id)]
+    assert env["notifier"].kinds == ["discovery"]
     assert env["sched"].jobs[f"notify_{rec.id}"]["run_at"] == START - timedelta(minutes=15)
+    assert rec.status == MintStatus.SCHEDULED.value
 
 
 @pytest.mark.asyncio
-async def test_rule3_sends_once_to_configured_group_and_topic(env):
+async def test_rule3_sends_discovery_and_reminder_to_configured_group_and_topic(env):
     await discover(env, make_stage(START))
     rec = await only_row(env)
     assert await fire(env, f"notify_{rec.id}") is True
-    assert env["notifier"].sent == [(GROUP, TOPIC, rec.id)]
-    # a duplicate/stale job fire does not send again
+    assert env["notifier"].sent == [(GROUP, TOPIC, rec.id), (GROUP, TOPIC, rec.id)]
+    assert env["notifier"].kinds == ["discovery", "reminder"]
+    # a duplicate/stale job fire does not send the reminder again
     env["clock"].now = START - timedelta(minutes=15)
     assert await env["svc"].send_alert(rec.id) is False
-    assert len(env["notifier"].sent) == 1
+    assert len(env["notifier"].sent) == 2
 
 
 @pytest.mark.asyncio
@@ -323,23 +328,33 @@ async def test_rule3_ignores_extra_broadcast_targets(env):
     await discover(env, make_stage(START))
     rec = await only_row(env)
     await fire(env, f"notify_{rec.id}")
-    assert [(c, t) for c, t, _ in env["notifier"].sent] == [(GROUP, TOPIC)]
+    assert [(c, t) for c, t, _ in env["notifier"].sent] == [(GROUP, TOPIC), (GROUP, TOPIC)]
 
 
 @pytest.mark.asyncio
-async def test_rule3_late_discovery_never_alerts(env):
-    # found 10 min before start (inside the 15-min window): no alert, ever
-    assert await discover(env, make_stage(T0 + timedelta(minutes=10))) == "missed"
+async def test_rule3_late_qualified_discovery_alerts_once(env):
+    # found 10 min before start (inside the 15-min window): discovery only, no reminder job
+    assert await discover(env, make_stage(T0 + timedelta(minutes=10))) == "notified"
+    assert len(env["notifier"].sent) == 1
+    assert env["notifier"].kinds == ["discovery"]
+    assert env["sched"].jobs.get(f"notify_{(await only_row(env)).id}") is None
+
+
+@pytest.mark.asyncio
+async def test_rule3_late_unqualified_discovery_is_missed(env):
+    assert await discover(env, make_stage(T0 + timedelta(minutes=10)), minted="500") == "missed"
     assert env["notifier"].sent == [] and env["sched"].jobs == {}
 
 
 @pytest.mark.asyncio
-async def test_rule3_never_sends_at_or_after_start(env):
+async def test_rule3_never_sends_reminder_at_or_after_start(env):
     await discover(env, make_stage(START))
     rec = await only_row(env)
+    assert len(env["notifier"].sent) == 1  # discovery already sent
     assert await fire(env, f"notify_{rec.id}", at=START) is False
-    assert env["notifier"].sent == []
-    assert (await only_row(env)).status == MintStatus.MISSED.value
+    assert len(env["notifier"].sent) == 1  # no reminder
+    # discovery already went out, so we keep NOTIFIED rather than MISSED
+    assert (await only_row(env)).status == MintStatus.NOTIFIED.value
 
 
 @pytest.mark.asyncio
@@ -347,7 +362,7 @@ async def test_rule3_late_job_beyond_grace_is_not_sent(env):
     await discover(env, make_stage(START))
     rec = await only_row(env)
     assert await fire(env, f"notify_{rec.id}", at=START - timedelta(minutes=10)) is False
-    assert env["notifier"].sent == []
+    assert len(env["notifier"].sent) == 1  # discovery only
 
 
 @pytest.mark.asyncio
@@ -360,8 +375,11 @@ async def test_rule3_late_job_beyond_grace_is_not_sent(env):
     lambda p: setattr(p.drop.next_stage, "label", "Allowlist"),              # became gated
 ])
 async def test_rule3_recheck_blocks_send_when_any_condition_fails(env, mutate):
-    await discover(env, make_stage(START))
+    # Pending (dynamic) at discovery so no discovery alert; reminder re-check blocks.
+    await discover(env, make_stage(START), minted="600")
     rec = await only_row(env)
+    assert env["notifier"].sent == []
+    env["provider"].drop.total_supply = "800"  # would pass at send unless mutated
     p = env["provider"]
     if p.drop is not None:
         p.drop.stages = [p.drop.next_stage]
@@ -373,12 +391,27 @@ async def test_rule3_recheck_blocks_send_when_any_condition_fails(env, mutate):
 
 @pytest.mark.asyncio
 async def test_rule3_dynamic_failure_at_discovery_is_rechecked_at_send_time(env):
-    # 60% minted at discovery, 80% by alert time -> one alert at start-15
+    # 60% minted at discovery (no discovery alert), 80% by alert time -> reminder at start-15
     await discover(env, make_stage(START), minted="600")
     rec = await only_row(env)
     assert rec.status == MintStatus.SCHEDULED.value
+    assert env["notifier"].sent == []
     env["provider"].drop.total_supply = "800"
     assert await fire(env, f"notify_{rec.id}") is True
+    assert env["notifier"].kinds == ["reminder"]
+
+
+@pytest.mark.asyncio
+async def test_rule3_becomes_qualified_on_later_poll_sends_discovery(env):
+    await discover(env, make_stage(START), minted="600")
+    assert env["notifier"].sent == []
+    env["provider"].drop.total_supply = "800"
+    assert await discover(env, make_stage(START), minted="800") == "unchanged"
+    rec = await only_row(env)
+    assert env["notifier"].sent == [(GROUP, TOPIC, rec.id)]
+    assert env["notifier"].kinds == ["discovery"]
+    assert rec.status == MintStatus.SCHEDULED.value
+    assert f"notify_{rec.id}" in env["sched"].jobs
 
 
 @pytest.mark.asyncio
@@ -396,9 +429,14 @@ async def test_rule4_deletion_scheduled_at_start_plus_10(env):
     await fire(env, f"notify_{rec.id}")
     job = env["sched"].jobs[f"delete_{rec.id}"]
     assert job["run_at"] == START + timedelta(minutes=10)
-    assert (await notifications(env))[0].delete_scheduled_at.replace(tzinfo=timezone.utc) == START + timedelta(minutes=10)
+    notifs = await notifications(env)
+    assert len(notifs) == 2
+    assert all(
+        n.delete_scheduled_at.replace(tzinfo=timezone.utc) == START + timedelta(minutes=10)
+        for n in notifs
+    )
     assert await fire(env, f"delete_{rec.id}") is True
-    assert env["notifier"].deleted == [(GROUP, 101)]
+    assert env["notifier"].deleted == [(GROUP, 101), (GROUP, 102)]
     assert (await only_row(env)).status == MintStatus.DELETED.value
 
 
@@ -427,7 +465,7 @@ async def test_rule5_same_phase_seen_again_is_not_duplicated(env):
     rec = await only_row(env)
     await fire(env, f"notify_{rec.id}")
     await discover(env, st)  # seen again after sending
-    assert len(env["notifier"].sent) == 1
+    assert len(env["notifier"].sent) == 2  # discovery + reminder, no extras
 
 
 @pytest.mark.asyncio
@@ -474,7 +512,7 @@ async def test_rule5_start_change_after_alert_reschedules_deletion(env):
     env["clock"].now = START - timedelta(minutes=5)
     assert await discover(env, make_stage(new_start)) == "deletion_rescheduled"
     assert env["sched"].jobs[f"delete_{rec.id}"]["run_at"] == new_start + timedelta(minutes=10)
-    assert len(env["notifier"].sent) == 1
+    assert len(env["notifier"].sent) == 2  # discovery + reminder
 
 
 @pytest.mark.asyncio
@@ -486,16 +524,32 @@ async def test_rule5_recovery_rearms_pending_alert(env):
     stats = await env["svc"].recover()
     assert stats["alerts_rescheduled"] == 1
     assert env["sched"].jobs[f"notify_{rec.id}"]["run_at"] == START - timedelta(minutes=15)
+    # discovery already sent — deletion must also be re-armed
+    assert stats["deletions_rescheduled"] == 1
 
 
 @pytest.mark.asyncio
-async def test_rule5_recovery_does_not_send_late_alerts(env):
-    await discover(env, make_stage(START))
+async def test_rule5_recovery_does_not_send_late_reminder(env):
+    # Pending at discovery so nothing was sent yet; too late for reminder after restart.
+    await discover(env, make_stage(START), minted="600")
+    assert env["notifier"].sent == []
     env["sched"].jobs.clear()
     env["clock"].now = START - timedelta(minutes=5)
     stats = await env["svc"].recover()
     assert stats["alerts_missed"] == 1 and env["sched"].jobs == {}
     assert env["notifier"].sent == []
+
+
+@pytest.mark.asyncio
+async def test_rule5_recovery_keeps_discovery_when_reminder_window_passed(env):
+    await discover(env, make_stage(START))
+    assert len(env["notifier"].sent) == 1
+    env["sched"].jobs.clear()
+    env["clock"].now = START - timedelta(minutes=5)
+    stats = await env["svc"].recover()
+    assert stats["alerts_missed"] == 0
+    assert (await only_row(env)).status == MintStatus.NOTIFIED.value
+    assert len(env["notifier"].sent) == 1  # no late reminder
 
 
 @pytest.mark.asyncio
@@ -514,7 +568,7 @@ async def test_rule5_recovery_deletes_overdue_and_rearms_future_deletions(env):
     env["clock"].now = START + timedelta(hours=3)
     stats = await env["svc"].recover()
     assert stats["deleted_overdue"] == 1
-    assert env["notifier"].deleted == [(GROUP, 101)]
+    assert env["notifier"].deleted == [(GROUP, 101), (GROUP, 102)]
     assert (await only_row(env)).status == MintStatus.DELETED.value
 
 

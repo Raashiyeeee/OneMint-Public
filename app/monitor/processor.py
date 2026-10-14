@@ -5,8 +5,9 @@ reschedule and restart recovery.
 Spec mapping
 ------------
 Rule 1/2  eligibility + offer ratio      -> app.filters.mint_filter.MintFilter
-Rule 3    one alert at start - 15 min    -> AlertService.process / send_alert
-          never on discovery, never at/after start, re-check before sending,
+Rule 3    discovery alert when qualified + reminder at start - 15 min
+          -> AlertService.process / send_alert
+          never at/after start for the reminder; re-check before reminder;
           only to TELEGRAM_GROUP_ID + PUBLIC_MINT_TOPIC_ID
 Rule 4    delete at start + 10 min       -> AlertService.send_alert / delete_alert
 Rule 5    dedupe, UTC, reschedule on start change, persistence + recovery
@@ -15,12 +16,13 @@ Rule 5    dedupe, UTC, reschedule on start change, persistence + recovery
 The database row (MintOpportunityDB) is the source of truth.  APScheduler jobs
 (persisted in the SQLAlchemy job store) only *trigger* work; every job re-reads
 the row and decides from it, so a stale or duplicated job can never cause a
-second alert.
+second reminder.
 
 Lifecycle
 ---------
 discovered ──(static rule fails)──────────────▶ REJECTED
-     │──(found after start - 15m)─────────────▶ MISSED   (never sent late)
+     │──(found at/after start)────────────────▶ MISSED
+     │──(qualified)──▶ discovery Telegram alert (immediate)
      ▼
  SCHEDULED ──(start - 15m, claim)─▶ SENDING ──(re-check fails)─▶ REJECTED
      ▲                                  │──(start moved)──▶ SCHEDULED (rescheduled)
@@ -158,12 +160,48 @@ class AlertService:
         rec.mint_end_time = mint.mint_end_time
         rec.updated_at = utcnow()
 
+    @staticmethod
+    def _is_reminder(n: NotificationDB) -> bool:
+        """True for the start-15m alert (legacy rows without kind count as reminders)."""
+        return getattr(n, "kind", None) in (None, "", rules.ALERT_KIND_REMINDER)
+
+    @staticmethod
+    def _is_discovery(n: NotificationDB) -> bool:
+        return getattr(n, "kind", None) == rules.ALERT_KIND_DISCOVERY
+
+    async def _has_kind(self, session, mint_id: str, kind: str) -> bool:
+        notifs = await NotificationRepository(session).get_all_by_mint_id(mint_id)
+        if kind == rules.ALERT_KIND_DISCOVERY:
+            return any(self._is_discovery(n) for n in notifs)
+        return any(self._is_reminder(n) for n in notifs)
+
+    async def _maybe_send_discovery(
+        self,
+        session,
+        rec: MintOpportunityDB,
+        mint: MintOpportunity,
+        start: datetime,
+        *,
+        finalize: bool,
+    ) -> Optional[int]:
+        """Send the immediate qualify alert once. finalize=True when no -15m reminder will fire."""
+        if await self._has_kind(session, rec.id, rules.ALERT_KIND_DISCOVERY):
+            return None
+        if await self._has_kind(session, rec.id, rules.ALERT_KIND_REMINDER):
+            return None
+        return await self._deliver(
+            session, rec, mint, start, kind=rules.ALERT_KIND_DISCOVERY, finalize=finalize
+        )
+
     # ── discovery / poll ──────────────────────────────────────────────────────
 
     async def process(
         self, raw: RawDrop, stage: RawDropStage, eth_price: Optional[Decimal]
     ) -> str:
-        """Handle one (drop, stage) seen during a poll. Never sends anything.
+        """Handle one (drop, stage) seen during a poll.
+
+        When the mint fully qualifies, sends a discovery alert immediately and
+        still schedules the start-15m reminder (if that window has not passed).
 
         Returns a short outcome string (useful for logs/tests).
         """
@@ -195,25 +233,49 @@ class AlertService:
                         self._health.rejected += 1
                     log.info("[MINT_REJECTED] external_id=%s %s", mint.external_id, rec.rejection_reason)
                     return "rejected"
-                if now >= notify_at:
+                if now >= start:
                     mint.status = MintStatus.MISSED
                     rec = _mint_to_db(mint)
-                    rec.rejection_reason = "discovered after mint_start - 15m; spec forbids late/discovery alerts"
+                    rec.rejection_reason = "discovered at or after mint start"
                     session.add(rec)
                     await session.commit()
-                    log.info("[MINT_MISSED] external_id=%s discovered too late", mint.external_id)
+                    log.info("[MINT_MISSED] external_id=%s discovered after start", mint.external_id)
                     return "missed"
+
+                can_schedule_reminder = now < notify_at
                 mint.status = MintStatus.SCHEDULED
-                mint.notification_scheduled_at = notify_at
+                mint.notification_scheduled_at = notify_at if can_schedule_reminder else None
                 mint.delete_scheduled_at = deletion_time(start)
                 rec = _mint_to_db(mint)
                 rec.rejection_reason = None if result.passed else f"pending re-check: {result.reason}"
                 session.add(rec)
                 await session.commit()
-                self._schedule_send(rec.id, notify_at)
-                if self._health and result.passed:
-                    self._health.qualified += 1
-                return "scheduled"
+
+                if result.passed:
+                    await self._maybe_send_discovery(
+                        session, rec, mint, start, finalize=not can_schedule_reminder
+                    )
+                    if self._health:
+                        self._health.qualified += 1
+
+                if can_schedule_reminder:
+                    # Re-load status: discovery finalize may have marked NOTIFIED
+                    await session.refresh(rec)
+                    if rec.status == MintStatus.SCHEDULED.value:
+                        self._schedule_send(rec.id, notify_at)
+                    return "scheduled"
+
+                # Inside the 15m window: discovery only (if qualified), no reminder job.
+                await session.refresh(rec)
+                if rec.status == MintStatus.NOTIFIED.value:
+                    return "notified"
+                rec.status = MintStatus.MISSED.value
+                rec.rejection_reason = (
+                    "discovered inside the 15-minute window without qualifying yet"
+                )
+                await session.commit()
+                log.info("[MINT_MISSED] external_id=%s inside alert window, not qualified", mint.external_id)
+                return "missed"
 
             # ── existing record: refresh, detect start-time change ──────────
             self._apply_snapshot(rec, mint)
@@ -249,35 +311,75 @@ class AlertService:
                 if start_changed:
                     rec.delete_scheduled_at = deletion_time(start)
                     rec.notification_scheduled_at = notify_at
+                    if now >= start:
+                        rec.status = MintStatus.MISSED.value
+                        rec.rejection_reason = "start time moved to the past"
+                        await session.commit()
+                        self._scheduler.cancel_job(f"notify_{rec.id}")
+                        self._scheduler.cancel_job(f"delete_{rec.id}")
+                        return "missed"
                     if now >= notify_at:
+                        # Too late for reminder; still send discovery if newly qualified.
+                        await session.commit()
+                        self._scheduler.cancel_job(f"notify_{rec.id}")
+                        if result.passed:
+                            await self._maybe_send_discovery(
+                                session, rec, mint, start, finalize=True
+                            )
+                            await session.refresh(rec)
+                            if rec.status == MintStatus.NOTIFIED.value:
+                                return "notified"
                         rec.status = MintStatus.MISSED.value
                         rec.rejection_reason = "start time moved inside the 15-minute alert window"
                         await session.commit()
-                        self._scheduler.cancel_job(f"notify_{rec.id}")
                         self._scheduler.cancel_job(f"delete_{rec.id}")
                         return "missed"
                     await session.commit()
                     self._schedule_send(rec.id, notify_at)
                     self._scheduler.cancel_job(f"delete_{rec.id}")
+                    if result.passed:
+                        await self._maybe_send_discovery(
+                            session, rec, mint, start, finalize=False
+                        )
                     return "rescheduled"
+
+                if result.passed and now < start:
+                    await self._maybe_send_discovery(
+                        session, rec, mint, start, finalize=now >= notify_at
+                    )
+                    await session.refresh(rec)
+                    if rec.status == MintStatus.NOTIFIED.value:
+                        self._scheduler.cancel_job(f"notify_{rec.id}")
+                        return "notified"
                 await session.commit()
                 return outcome
 
             # REJECTED / MISSED / EXPIRED / FAILED — may become eligible again
-            # (e.g. minted % rose, or start moved later), but only if an alert
+            # (e.g. minted % rose, or start moved later), but only if a reminder
             # has never been sent for this phase.
             if (
                 rec.status in (MintStatus.REJECTED.value, MintStatus.MISSED.value)
                 and rec.notification_sent_at is None
+                and not await self._has_kind(session, rec.id, rules.ALERT_KIND_REMINDER)
                 and not static_fail
-                and now < notify_at
+                and now < start
             ):
+                can_schedule_reminder = now < notify_at
                 rec.status = MintStatus.SCHEDULED.value
-                rec.notification_scheduled_at = notify_at
+                rec.notification_scheduled_at = notify_at if can_schedule_reminder else None
                 rec.delete_scheduled_at = deletion_time(start)
                 rec.rejection_reason = None if result.passed else f"pending re-check: {result.reason}"
                 await session.commit()
-                self._schedule_send(rec.id, notify_at)
+                if result.passed:
+                    await self._maybe_send_discovery(
+                        session, rec, mint, start, finalize=not can_schedule_reminder
+                    )
+                await session.refresh(rec)
+                if can_schedule_reminder and rec.status == MintStatus.SCHEDULED.value:
+                    self._schedule_send(rec.id, notify_at)
+                    return "scheduled"
+                if rec.status == MintStatus.NOTIFIED.value:
+                    return "notified"
                 return "scheduled"
             await session.commit()
             return outcome
@@ -285,7 +387,7 @@ class AlertService:
     # ── send (rule 3) ─────────────────────────────────────────────────────────
 
     async def send_alert(self, mint_id: str) -> bool:
-        """Fire the single alert for a phase. Returns True only if a message was sent."""
+        """Fire the start-15m reminder for a phase. Returns True only if a message was sent."""
         now = self._now()
         async with self._factory()() as session:
             rec = await session.get(MintOpportunityDB, mint_id)
@@ -299,8 +401,13 @@ class AlertService:
                 self._schedule_send(mint_id, notify_at)
                 return False
             if now >= start or now > notify_at + rules.SEND_GRACE:
-                rec.status = MintStatus.MISSED.value
-                rec.rejection_reason = f"alert window missed (now={now.isoformat()})"
+                # Discovery may already have been sent; only miss the reminder.
+                if await self._has_kind(session, mint_id, rules.ALERT_KIND_DISCOVERY):
+                    rec.status = MintStatus.NOTIFIED.value
+                    rec.rejection_reason = f"reminder window missed (now={now.isoformat()})"
+                else:
+                    rec.status = MintStatus.MISSED.value
+                    rec.rejection_reason = f"alert window missed (now={now.isoformat()})"
                 await session.commit()
                 log.warning("[ALERT_MISSED] mint_id=%s", mint_id)
                 return False
@@ -316,7 +423,7 @@ class AlertService:
                 return False
 
             existing = await NotificationRepository(session).get_all_by_mint_id(mint_id)
-            if existing:
+            if any(self._is_reminder(n) for n in existing) or rec.notification_sent_at is not None:
                 rec.status = MintStatus.NOTIFIED.value
                 await session.commit()
                 return False
@@ -350,21 +457,42 @@ class AlertService:
                 await session.commit()
                 return False
 
-            msg_id = await self._deliver(session, rec, mint, start)
+            msg_id = await self._deliver(
+                session, rec, mint, start, kind=rules.ALERT_KIND_REMINDER, finalize=True
+            )
         return msg_id is not None
 
-    async def _deliver(self, session, rec: MintOpportunityDB, mint: MintOpportunity, start: datetime) -> Optional[int]:
-        """Send to the configured group/topic only, record it, schedule deletion at start+10."""
+    async def _deliver(
+        self,
+        session,
+        rec: MintOpportunityDB,
+        mint: MintOpportunity,
+        start: datetime,
+        *,
+        kind: str = rules.ALERT_KIND_REMINDER,
+        finalize: bool = True,
+    ) -> Optional[int]:
+        """Send to the configured group/topic only, record it, schedule deletion at start+10.
+
+        Discovery alerts keep status SCHEDULED (unless finalize=True) so the -15m
+        reminder job can still fire. Reminder / finalized alerts mark NOTIFIED.
+        """
         mint_id = rec.id
         self._apply_snapshot(rec, mint)
         rec.rejection_reason = None
         chat_id = self._settings.telegram_group_id
         topic_id = self._settings.public_mint_topic_id
-        msg_id = await self._notifier.send_to_target(rec, chat_id, topic_id)
+        send_kwargs = {"kind": kind}
+        try:
+            msg_id = await self._notifier.send_to_target(rec, chat_id, topic_id, **send_kwargs)
+        except TypeError:
+            # Older fakes / callers without the kind kwarg.
+            msg_id = await self._notifier.send_to_target(rec, chat_id, topic_id)
         if not msg_id:
-            rec.status = MintStatus.FAILED.value
-            rec.rejection_reason = "telegram send failed"
-            await session.commit()
+            if kind == rules.ALERT_KIND_REMINDER or finalize:
+                rec.status = MintStatus.FAILED.value
+                rec.rejection_reason = "telegram send failed"
+                await session.commit()
             return None
         del_at = deletion_time(start)
         session.add(
@@ -374,29 +502,36 @@ class AlertService:
                 chat_id=chat_id,
                 message_id=msg_id,
                 message_thread_id=topic_id,
+                kind=kind,
                 delete_scheduled_at=del_at,
             )
         )
-        rec.status = MintStatus.NOTIFIED.value
-        rec.notification_sent_at = utcnow()
         rec.notification_message_id = msg_id
         rec.delete_scheduled_at = del_at
+        if finalize or kind == rules.ALERT_KIND_REMINDER:
+            rec.status = MintStatus.NOTIFIED.value
+            rec.notification_sent_at = utcnow()
+        # else: stay SCHEDULED so the reminder job can claim later
         await session.commit()
         if self._health:
             self._health.notifications_sent += 1
         self._schedule_delete(mint_id, msg_id, del_at)
-        log.info("[ALERT_SENT] mint_id=%s message_id=%s delete_at=%s", mint_id, msg_id, del_at.isoformat())
+        log.info(
+            "[ALERT_SENT] mint_id=%s kind=%s message_id=%s delete_at=%s",
+            mint_id, kind, msg_id, del_at.isoformat(),
+        )
         return msg_id
 
     # ── manual /sendtoday ─────────────────────────────────────────────────────
 
     async def send_today(self) -> list[dict]:
-        """Admin-triggered early alerts for today's (UTC) upcoming mints.
+        """Admin-triggered early reminder alerts for today's (UTC) upcoming mints.
 
-        Each candidate is re-checked on fresh data; passing ones are sent now
-        to the configured group/topic only, recorded as NOTIFIED (so the
+        Each candidate is re-checked on fresh data; passing ones get the reminder
+        sent now to the configured group/topic only, recorded as NOTIFIED (so the
         automatic start-15m job will skip them) and get deletion at start+10.
-        Returns [{mint_id, name, start, sent: bool, reason}].
+        Discovery alerts alone do not block this — /sendtoday still sends the
+        reminder early. Returns [{mint_id, name, start, sent: bool, reason}].
         """
         now = self._now()
         day_end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
@@ -428,7 +563,12 @@ class AlertService:
                     item["reason"] = "already started"
                     continue
                 notifs = await NotificationRepository(session).get_all_by_mint_id(mint_id)
-                if rec.notification_sent_at is not None or notifs or rec.status in ACTIVE_SENT + (MintStatus.DELETED.value,):
+                reminder_done = (
+                    rec.notification_sent_at is not None
+                    or any(self._is_reminder(n) for n in notifs)
+                    or rec.status in ACTIVE_SENT + (MintStatus.DELETED.value,)
+                )
+                if reminder_done:
                     item["reason"] = "already alerted"
                     continue
                 prev_status = rec.status
@@ -461,7 +601,9 @@ class AlertService:
                     await session.commit()
                     item["reason"] = "started during re-check"
                     continue
-                msg_id = await self._deliver(session, rec, fresh, start)
+                msg_id = await self._deliver(
+                    session, rec, fresh, start, kind=rules.ALERT_KIND_REMINDER, finalize=True
+                )
                 if msg_id is None:
                     item["reason"] = "telegram send failed"
                     continue
@@ -512,7 +654,11 @@ class AlertService:
             rec = await session.get(MintOpportunityDB, mint_id)
             if rec is None:
                 return False
-            if rec.status not in ACTIVE_SENT:
+            notifs = await NotificationRepository(session).get_all_by_mint_id(mint_id)
+            # Allow deletion after discovery-only (still SCHEDULED) or after NOTIFIED.
+            if rec.status not in ACTIVE_SENT and not (
+                rec.status in ACTIVE_UNSENT and notifs
+            ):
                 return False
             del_at = deletion_time(rec.mint_start_time)
             if now < del_at - _EARLY_TOLERANCE:
@@ -520,7 +666,6 @@ class AlertService:
                 self._schedule_delete(mint_id, rec.notification_message_id or 0, del_at)
                 return False
 
-            notifs = await NotificationRepository(session).get_all_by_mint_id(mint_id)
             all_ok = True
             for n in notifs:
                 if n.deleted_at is None:
@@ -562,26 +707,39 @@ class AlertService:
                 start = ensure_utc(rec.mint_start_time)
                 if rec.status in ACTIVE_UNSENT:
                     notifs = await NotificationRepository(session).get_all_by_mint_id(rec.id)
-                    if notifs:  # crashed after sending but before marking NOTIFIED
+                    if any(self._is_reminder(n) for n in notifs) or rec.notification_sent_at is not None:
+                        # Crashed after reminder send but before marking NOTIFIED.
                         rec.status = MintStatus.NOTIFIED.value
-                        rec.notification_message_id = notifs[0].message_id
+                        rec.notification_message_id = notifs[0].message_id if notifs else rec.notification_message_id
                     else:
+                        # No reminder yet (discovery-only or nothing sent): re-arm -15m job.
                         notify_at = alert_time(start)
                         rec.status = MintStatus.SCHEDULED.value
                         if now < notify_at:
                             self._schedule_send(rec.id, notify_at)
                             stats["alerts_rescheduled"] += 1
+                            if notifs:
+                                # Discovery already sent — still need deletion at start+10.
+                                del_at = deletion_time(start)
+                                rec.delete_scheduled_at = del_at
+                                self._schedule_delete(rec.id, rec.notification_message_id or 0, del_at)
+                                stats["deletions_rescheduled"] += 1
                             continue
                         if now <= notify_at + rules.SEND_GRACE and now < start:
                             self._schedule_send(rec.id, now)
                             stats["alerts_rescheduled"] += 1
                             continue
-                        rec.status = MintStatus.MISSED.value
-                        rec.rejection_reason = "alert window passed while bot was offline"
-                        self._scheduler.cancel_job(f"notify_{rec.id}")
-                        stats["alerts_missed"] += 1
-                        continue
-                # sent: delete at start + 10 (recomputed from start, not from stored value)
+                        if notifs:
+                            # Discovery was sent; reminder window is gone.
+                            rec.status = MintStatus.NOTIFIED.value
+                            rec.notification_message_id = notifs[0].message_id
+                        else:
+                            rec.status = MintStatus.MISSED.value
+                            rec.rejection_reason = "alert window passed while bot was offline"
+                            self._scheduler.cancel_job(f"notify_{rec.id}")
+                            stats["alerts_missed"] += 1
+                            continue
+                # sent (or discovery+missed reminder): delete at start + 10
                 del_at = deletion_time(start)
                 rec.delete_scheduled_at = del_at
                 if now >= del_at:

@@ -8,7 +8,8 @@ rules *stricter* (see app.config validators); timing is fixed.
 1. Eligibility: public mint only, price <= $13, >= 70% minted, reliable start
    time, credible offer price.
 2. Offer >= mint price x 1.40 (gross, before fees).
-3. One alert at mint_start - 15 min, re-checked right before sending.
+3. Alerts: immediate when fully qualified, plus reminder at mint_start - 15 min
+   (re-checked right before the reminder).
 4. Delete at mint_start + 10 min.
 5. No duplicates, UTC everywhere, reschedule on start-time change, persist and
    recover pending jobs.
@@ -24,6 +25,10 @@ MIN_MINTED_PERCENTAGE = Decimal("70")
 
 ALERT_BEFORE_START = timedelta(minutes=15)
 DELETE_AFTER_START = timedelta(minutes=10)
+
+# Notification kinds stored on NotificationDB.kind
+ALERT_KIND_DISCOVERY = "discovery"
+ALERT_KIND_REMINDER = "reminder"
 
 # A send job that fires later than this after mint_start - 15m (e.g. the
 # process was down) is considered missed and is NOT sent late.

@@ -44,10 +44,25 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
 
 
 async def create_tables() -> None:
-    """Create all tables if they don't already exist."""
+    """Create all tables if they don't already exist, then apply light migrations."""
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_ensure_notification_kind_column)
+
+
+def _ensure_notification_kind_column(sync_conn) -> None:
+    """Add notifications.kind on existing SQLite DBs created before dual alerts."""
+    dialect = sync_conn.dialect.name
+    if dialect != "sqlite":
+        # create_all handles new installs; non-SQLite deployments should migrate explicitly.
+        return
+    rows = sync_conn.exec_driver_sql("PRAGMA table_info(notifications)").fetchall()
+    columns = {row[1] for row in rows}
+    if "kind" not in columns:
+        sync_conn.exec_driver_sql(
+            "ALTER TABLE notifications ADD COLUMN kind VARCHAR(32) NOT NULL DEFAULT 'reminder'"
+        )
 
 
 async def dispose_engine() -> None:
