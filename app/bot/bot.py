@@ -47,7 +47,7 @@ BOT_COMMANDS = [
     BotCommand("addtarget",    "Add a destination group or channel"),
     BotCommand("removetarget", "Remove a destination group or channel"),
     BotCommand("stats",        "Today's discovery stats"),
-    BotCommand("sendtoday",    "Send alerts for unnotified mints today"),
+    BotCommand("sendtoday",    "Admin: send eligible alerts for today now"),
     BotCommand("recent",       "Last 5 qualified mints"),
     BotCommand("jobs",         "Show pending scheduled jobs"),
     BotCommand("admins",       "List all current admins"),
