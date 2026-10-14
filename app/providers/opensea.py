@@ -353,14 +353,17 @@ class OpenSeaProvider(BaseMintProvider):
             currency = (price_info.get("currency") or "WETH").upper()
             if currency in ("ETH", "WETH"):
                 if eth_price is None:
-                    eth_price = await self.get_eth_price_usd()
+                    eth_price = await self.get_reliable_eth_price_usd()
+                if eth_price is None:
+                    continue  # no live ETH/USD rate -> not a credible USD value
                 offer_usd = token_amount * eth_price
             elif currency in ("USDC", "USDT", "DAI", "USD", "USDBC"):
                 offer_usd = token_amount
             else:
-                if eth_price is None:
-                    eth_price = await self.get_eth_price_usd()
-                offer_usd = token_amount * eth_price
+                # Unknown currency: we cannot convert it credibly, so skip it
+                # rather than pretending it is ETH.
+                log.debug("[OFFERS] Skipping offer in unsupported currency %s", currency)
+                continue
 
             if best_offer_usd is None or offer_usd > best_offer_usd:
                 best_offer_usd = offer_usd
@@ -374,6 +377,24 @@ class OpenSeaProvider(BaseMintProvider):
             )
             return float(quantized)
 
+        return None
+
+    async def get_reliable_eth_price_usd(self) -> Optional[Decimal]:
+        """Return a live (or <= 5 min cached) ETH/USD rate, or None.
+
+        Unlike get_eth_price_usd() this never returns the hard-coded
+        DEFAULT_ETH_USD fallback or a stale cache, because USD thresholds
+        ($13 cap, 1.40x offer) must not be evaluated on a made-up rate.
+        """
+        import time
+
+        price = await self.get_eth_price_usd()
+        if (
+            self._cached_eth_price is not None
+            and self._cached_eth_time is not None
+            and time.time() - self._cached_eth_time < 300
+        ):
+            return price
         return None
 
     async def get_eth_price_usd(self) -> Decimal:
@@ -465,22 +486,39 @@ class OpenSeaProvider(BaseMintProvider):
         -----
         raw.chain (OpenSea API identifier) → internal slug via registry.
         """
-        eth_usd = Decimal(str(eth_price_usd))
+        from app.rules import ETH_NATIVE_CHAINS
+
+        eth_usd = Decimal(str(eth_price_usd)) if eth_price_usd is not None else None
+        chain_config = get_chain_by_api_id(raw.chain)
+        chain_slug = chain_config.slug if chain_config else raw.chain
 
         # ── Mint price ──────────────────────────────────────────────────────
-        mint_price_eth = Decimal("0")
+        # Never default an unknown price to $0 (that would make it look free).
+        mint_price_eth: Optional[Decimal] = None
         mint_price_usd = Decimal("0")
-        if stage.price:
+        price_unreliable: Optional[str] = None
+        currency = (stage.price_currency_address or "").lower()
+        if stage.price is None or str(stage.price).strip() == "":
+            price_unreliable = "stage price missing"
+        elif currency and currency != NATIVE_TOKEN_ADDRESS:
+            price_unreliable = f"price currency {currency} is not the native token"
+        elif chain_slug not in ETH_NATIVE_CHAINS:
+            price_unreliable = f"native token of chain '{chain_slug}' is not ETH"
+        else:
             try:
-                wei = Decimal(stage.price)
-                mint_price_eth = (wei / Decimal("1e18")).quantize(
-                    Decimal("0.000001"), rounding=ROUND_HALF_UP
-                )
-                mint_price_usd = (mint_price_eth * eth_usd).quantize(
-                    Decimal("0.01"), rounding=ROUND_HALF_UP
-                )
+                wei = Decimal(str(stage.price))
+                if wei < 0:
+                    raise InvalidOperation
+                mint_price_eth = wei / Decimal("1e18")
+                if wei == 0:
+                    mint_price_usd = Decimal("0")
+                elif eth_usd is None or eth_usd <= 0:
+                    price_unreliable = "no live ETH/USD rate"
+                else:
+                    # Keep sub-cent precision so $13.004 is not rounded to $13.00.
+                    mint_price_usd = (mint_price_eth * eth_usd).quantize(Decimal("0.00000001"))
             except InvalidOperation:
-                pass  # stays zero — validator will reject if needed
+                price_unreliable = f"unparseable stage price {stage.price!r}"
 
         # ── Offer price ─────────────────────────────────────────────────────
         target_offer = offer_price_usd if offer_price_usd is not None else floor_price_usd
@@ -490,13 +528,16 @@ class OpenSeaProvider(BaseMintProvider):
                 Decimal("0.01"), rounding=ROUND_HALF_UP
             )
 
-        # ── Chain mapping ───────────────────────────────────────────────────
-        chain_config = get_chain_by_api_id(raw.chain)
-        chain_slug = chain_config.slug if chain_config else raw.chain
-
-        # ── Timestamps ──────────────────────────────────────────────────────
+        # ── Timestamps (UTC) ────────────────────────────────────────────────
         mint_start = _parse_dt(stage.start_time)
-        mint_end = _parse_dt(stage.end_time)
+        start_unreliable: Optional[str] = None
+        mint_end: Optional[datetime] = None
+        try:
+            mint_end = _parse_dt(stage.end_time) if stage.end_time else None
+        except ValueError:
+            start_unreliable = "stage end time unparseable"
+        if mint_start.year < 2000:
+            start_unreliable = "start time is a placeholder epoch value"
 
         # ── Supply ──────────────────────────────────────────────────────────
         # OpenSea naming is inverted in the detailed response:
@@ -527,8 +568,12 @@ class OpenSeaProvider(BaseMintProvider):
             external_id=stage.uuid,
             project_name=raw.collection_name or raw.collection_slug,
             chain=chain_slug,
-            contract_address=raw.contract_address,
+            contract_address=raw.contract_address.lower(),
             mint_type=stage.stage_type,
+            stage_label=stage.label,
+            allowlist_wallet_count=stage.allowlist_wallet_count,
+            price_unreliable_reason=price_unreliable,
+            start_time_unreliable_reason=start_unreliable,
             mint_price_eth=mint_price_eth,
             mint_price_usd=mint_price_usd,
             offer_price_usd=final_offer_usd,
@@ -552,7 +597,7 @@ def _parse_dt(iso_str: str) -> datetime:
     dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+    return dt.astimezone(timezone.utc)
 
 
 def _offer_matches_contract(offer: dict, target_contract: Optional[str]) -> bool:

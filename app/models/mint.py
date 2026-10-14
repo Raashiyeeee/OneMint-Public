@@ -29,6 +29,8 @@ class MintStatus(str, Enum):
     VALIDATED = "VALIDATED"
     REJECTED = "REJECTED"
     SCHEDULED = "SCHEDULED"
+    SENDING = "SENDING"
+    MISSED = "MISSED"
     NOTIFIED = "NOTIFIED"
     DELETE_PENDING = "DELETE_PENDING"
     DELETED = "DELETED"
@@ -56,6 +58,14 @@ class MintOpportunity(BaseModel):
 
     # Mint details
     mint_type: str = Field(..., description="Mint stage type (e.g. 'public_sale')")
+    stage_label: Optional[str] = Field(None, description="Stage label from the provider")
+    allowlist_wallet_count: Optional[int] = Field(None, description="Wallets on the stage allowlist")
+    price_unreliable_reason: Optional[str] = Field(
+        None, description="Set when the USD mint price could not be computed reliably"
+    )
+    start_time_unreliable_reason: Optional[str] = Field(
+        None, description="Set when the stage start time is not confirmed/reliable"
+    )
     mint_price_eth: Optional[Decimal] = Field(
         None, description="Mint price in native ETH/chain token"
     )
@@ -103,8 +113,10 @@ class MintOpportunity(BaseModel):
     def ensure_utc(cls, v: Optional[datetime]) -> Optional[datetime]:
         if v is None:
             return v
-        if isinstance(v, datetime) and v.tzinfo is None:
-            return v.replace(tzinfo=timezone.utc)
+        if isinstance(v, datetime):
+            if v.tzinfo is None:
+                return v.replace(tzinfo=timezone.utc)
+            return v.astimezone(timezone.utc)  # always store UTC
         return v
 
     @field_validator("minted_percentage", mode="before")

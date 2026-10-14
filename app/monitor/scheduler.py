@@ -28,7 +28,20 @@ from apscheduler.executors.asyncio import AsyncIOExecutor
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from app.rules import SEND_GRACE
+
 log = logging.getLogger(__name__)
+
+
+def _utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _same_time(job, run_at: datetime) -> bool:
+    nrt = getattr(job, "next_run_time", None)
+    return isinstance(nrt, datetime) and _utc(nrt) == run_at
 
 # How long past a scheduled time a job is still allowed to run (seconds)
 MISFIRE_GRACE_SECONDS = 900  # 15 minutes — generous for a monitoring bot
@@ -50,6 +63,7 @@ class MintScheduler:
         # APScheduler requires a sync URL; aiosqlite URLs are converted
         sync_url = db_url.replace("sqlite+aiosqlite", "sqlite")
         self._scheduler = AsyncIOScheduler(
+            timezone=timezone.utc,
             jobstores={
                 "default": SQLAlchemyJobStore(url=sync_url),
             },
@@ -97,11 +111,15 @@ class MintScheduler:
             APScheduler job ID, or None if scheduling failed.
         """
         job_id = f"notify_{mint_id}"
-        if self._scheduler.get_job(job_id):
+        run_at = _utc(run_at)
+        existing = self._scheduler.get_job(job_id)
+        if existing is not None and _same_time(existing, run_at):
             log.debug("[SCHEDULER] Notification job already exists: %s", job_id)
             return job_id
 
         try:
+            # replace_existing=True: a changed start time reschedules the job
+            # instead of leaving the stale one in place.
             self._scheduler.add_job(
                 send_fn,
                 "date",
@@ -109,6 +127,9 @@ class MintScheduler:
                 args=[mint_id],
                 id=job_id,
                 replace_existing=True,
+                # A send that is late by more than the grace is dropped; the
+                # alert must go out at start - 15m, not whenever we come back.
+                misfire_grace_time=int(SEND_GRACE.total_seconds()),
             )
             log.info(
                 "[MINT_SCHEDULED] mint_id=%s notify_at=%s",
@@ -137,12 +158,14 @@ class MintScheduler:
         message_id : int
             Telegram message ID to delete.
         run_at : datetime
-            UTC time to delete (= mint_start_time + 15 min).
+            UTC time to delete (= mint_start_time + 10 min).
         delete_fn : coroutine function
             Async function: ``delete_fn(mint_id, message_id)``
         """
         job_id = f"delete_{mint_id}"
-        if self._scheduler.get_job(job_id):
+        run_at = _utc(run_at)
+        existing = self._scheduler.get_job(job_id)
+        if existing is not None and _same_time(existing, run_at):
             log.debug("[SCHEDULER] Deletion job already exists: %s", job_id)
             return job_id
 
@@ -154,6 +177,8 @@ class MintScheduler:
                 args=[mint_id, message_id],
                 id=job_id,
                 replace_existing=True,
+                # Overdue deletions must still run, however late.
+                misfire_grace_time=None,
             )
             log.info(
                 "[SCHEDULER] Deletion scheduled mint_id=%s message_id=%d delete_at=%s",
@@ -168,7 +193,10 @@ class MintScheduler:
 
     def cancel_job(self, job_id: str) -> None:
         """Cancel a scheduled job if it exists."""
-        job = self._scheduler.get_job(job_id)
+        try:
+            job = self._scheduler.get_job(job_id)
+        except Exception:
+            job = None
         if job:
             job.remove()
             log.info("[SCHEDULER] Cancelled job %s", job_id)

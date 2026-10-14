@@ -24,7 +24,7 @@ from app.config import Settings
 from app.database.database import get_session_factory
 from app.database.models import MintOpportunityDB, NotificationDB
 from app.database.repository import SystemStateRepository
-from app.monitor.processor import MintProcessor, _run_delete_job
+from app.monitor.processor import AlertService, set_alert_service
 from app.monitor.scheduler import MintScheduler
 from app.providers.base import RawDropStage
 from app.providers.opensea import OpenSeaProvider
@@ -88,6 +88,14 @@ class MintMonitor:
         self._enabled = True
         self.health = MonitorHealth()
         self.last_eth_price: Optional[Decimal] = None
+        self.alerts = AlertService(
+            settings=settings,
+            provider=provider,
+            notifier=notifier,
+            scheduler=scheduler,
+            health=self.health,
+        )
+        set_alert_service(self.alerts)
 
     async def start(self) -> None:
         """Start the monitoring loop. Runs until stop() is called."""
@@ -160,7 +168,8 @@ class MintMonitor:
             return
 
         # Fetch ETH price once per cycle
-        eth_price = await self._provider.get_eth_price_usd()
+        # Only a live rate is used for USD thresholds; None => prices unreliable.
+        eth_price = await self._provider.get_reliable_eth_price_usd()
         self.last_eth_price = eth_price
 
         log.info(
@@ -212,231 +221,12 @@ class MintMonitor:
         self,
         raw_drop,
         stage: RawDropStage,
-        eth_price: Decimal,
+        eth_price: Optional[Decimal],
     ) -> None:
-        """Process a single drop+stage within its own DB transaction."""
-        factory = get_session_factory()
-        async with factory() as session:
-            processor = MintProcessor(
-                settings=self._settings,
-                provider=self._provider,
-                session=session,
-                scheduler=self._scheduler,
-                notifier=self._notifier,
-                eth_price_usd=eth_price,
-                health=self.health,
-            )
-            await processor.process(raw_drop, stage)
+        """Process a single drop+stage. Discovery never sends an alert."""
+        await self.alerts.process(raw_drop, stage, eth_price)
 
     async def _recover_on_startup(self) -> None:
-        """
-        On startup, scan the database for any SCHEDULED mints that may have
-        been missed while the application was down, and reschedule them.
-        """
-        from app.database.models import MintOpportunityDB
-        from app.database.repository import MintRepository
-        from app.models.mint import MintStatus
-        from app.utils.time import delete_time, notification_time
-        from sqlalchemy import select
-
+        """Re-arm pending alerts/deletions and delete overdue messages."""
         log.info("[MONITOR_CYCLE] Running startup recovery scan...")
-
-        factory = get_session_factory()
-        async with factory() as session:
-            # Recover SCHEDULED mints
-            result = await session.execute(
-                select(MintOpportunityDB).where(
-                    MintOpportunityDB.status.in_([
-                        MintStatus.SCHEDULED.value,
-                        MintStatus.NOTIFIED.value,
-                    ])
-                )
-            )
-            records = list(result.scalars().all())
-
-        for record in records:
-            now = datetime.now(timezone.utc)
-            mint_start = record.mint_start_time
-
-            if mint_start.tzinfo is None:
-                mint_start = mint_start.replace(tzinfo=timezone.utc)
-
-            deletion_at = delete_time(mint_start, self._settings.delete_after_minutes)
-            notif_at = notification_time(mint_start, self._settings.notification_before_minutes)
-
-            if record.status == MintStatus.SCHEDULED.value:
-                if now >= deletion_at:
-                    # Too late — expire
-                    async with factory() as session:
-                        await MintRepository(session).update_status(
-                            record.id, MintStatus.EXPIRED
-                        )
-                        await session.commit()
-                    log.info("[MONITOR_CYCLE] Expired on recovery: %s", record.id)
-                elif now >= notif_at:
-                    # Should have been sent by now — send immediately
-                    self._scheduler.schedule_notification(
-                        mint_id=record.id,
-                        run_at=now,  # immediate
-                        send_fn=self._make_send_fn(record),
-                    )
-                else:
-                    # Still in the future — reschedule
-                    self._scheduler.schedule_notification(
-                        mint_id=record.id,
-                        run_at=notif_at,
-                        send_fn=self._make_send_fn(record),
-                    )
-                log.info(
-                    "[MONITOR_CYCLE] Recovered SCHEDULED mint: %s notify_at=%s",
-                    record.id,
-                    notif_at.isoformat(),
-                )
-
-            elif record.status == MintStatus.NOTIFIED.value:
-                msg_id = record.notification_message_id
-                if msg_id and record.delete_scheduled_at:
-                    del_at = record.delete_scheduled_at
-                    if del_at.tzinfo is None:
-                        del_at = del_at.replace(tzinfo=timezone.utc)
-                    run_at = max(del_at, now)  # if past, run immediately
-                    self._scheduler.schedule_deletion(
-                        mint_id=record.id,
-                        message_id=msg_id,
-                        run_at=run_at,
-                        delete_fn=_run_delete_job,
-                    )
-                    log.info(
-                        "[MONITOR_CYCLE] Recovered NOTIFIED mint deletion: %s delete_at=%s",
-                        record.id,
-                        run_at.isoformat(),
-                    )
-
-        # In manual filtering mode, also recover & alert any unnotified mints from today
-        if self._settings.notify_all_discovered:
-            today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-            async with factory() as session:
-                result = await session.execute(
-                    select(MintOpportunityDB).where(
-                        MintOpportunityDB.created_at >= today_start,
-                        MintOpportunityDB.notification_sent_at.is_(None),
-                    )
-                )
-                unnotified_today = list(result.scalars().all())
-
-            if unnotified_today:
-                log.info(
-                    "[MONITOR_CYCLE] Found %d unnotified mints from today in manual filtering mode — sending alerts now",
-                    len(unnotified_today),
-                )
-                for unnotified in unnotified_today:
-                    try:
-                        send_fn = self._make_send_fn(unnotified)
-                        await send_fn(unnotified.id)
-                        log.info(
-                            "[MONITOR_CYCLE] Dispatched alert for unnotified mint: %s (%s)",
-                            unnotified.id,
-                            unnotified.project_name,
-                        )
-                    except Exception as exc:
-                        log.error(
-                            "[MONITOR_CYCLE] Failed to send unnotified mint %s: %s",
-                            unnotified.id,
-                            exc,
-                        )
-
-        log.info(
-            "[MONITOR_CYCLE] Recovery complete — recovered %d records", len(records)
-        )
-
-    def _make_send_fn(self, record: MintOpportunityDB):
-        """Create a closure for the scheduler to send a notification."""
-        notifier = self._notifier
-        settings = self._settings
-
-        async def _send(mint_id: str) -> None:
-            from app.database.database import get_session_factory
-            from app.database.models import MintOpportunityDB, NotificationDB
-            from app.database.repository import MintRepository, NotificationRepository, TargetRepository
-            from app.models.mint import MintStatus
-            from app.utils.time import utcnow, delete_time
-            from sqlalchemy import select
-            import uuid
-
-            factory = get_session_factory()
-            async with factory() as session:
-                result = await session.execute(
-                    select(MintOpportunityDB).where(MintOpportunityDB.id == mint_id)
-                )
-                rec = result.scalar_one_or_none()
-                if rec is None:
-                    return
-
-                targets: list[tuple[int, Optional[int]]] = [
-                    (settings.telegram_group_id, settings.public_mint_topic_id)
-                ]
-                seen = {(settings.telegram_group_id, settings.public_mint_topic_id)}
-                try:
-                    extra = await TargetRepository(session).get_all_active()
-                    for t in extra:
-                        key = (t.chat_id, t.topic_id)
-                        if key not in seen:
-                            seen.add(key)
-                            targets.append(key)
-                except Exception as exc:
-                    log.warning("[BROADCAST] Could not load extra targets: %s", exc)
-
-                sent_messages: list[tuple[int, int, Optional[int]]] = []
-                for chat_id, topic_id in targets:
-                    msg_id = await notifier.send_to_target(rec, chat_id, topic_id)
-                    if msg_id:
-                        sent_messages.append((chat_id, msg_id, topic_id))
-
-                if not sent_messages:
-                    await MintRepository(session).update_status(mint_id, MintStatus.FAILED)
-                    await session.commit()
-                    return
-
-                self.health.notifications_sent += len(sent_messages)
-
-                mint_start = rec.mint_start_time
-                if mint_start and mint_start.tzinfo is None:
-                    mint_start = mint_start.replace(tzinfo=timezone.utc)
-
-                now_dt = datetime.now(timezone.utc)
-                del_at: Optional[datetime] = None
-                if settings.delete_after_minutes > 0:
-                    base_del = delete_time(mint_start, settings.delete_after_minutes) if mint_start else None
-                    min_del = now_dt + timedelta(minutes=settings.delete_after_minutes)
-                    del_at = max(base_del, min_del) if base_del else min_del
-
-                primary_msg_id = sent_messages[0][1]
-                notif_repo = NotificationRepository(session)
-                for chat_id, msg_id, topic_id in sent_messages:
-                    notif = NotificationDB(
-                        id=str(uuid.uuid4()),
-                        mint_id=mint_id,
-                        chat_id=chat_id,
-                        message_id=msg_id,
-                        message_thread_id=topic_id,
-                        delete_scheduled_at=del_at,
-                    )
-                    await notif_repo.save_notification(notif)
-
-                await MintRepository(session).update_status(
-                    mint_id,
-                    MintStatus.NOTIFIED,
-                    {"notification_sent_at": utcnow(), "notification_message_id": primary_msg_id},
-                )
-                await session.commit()
-
-            if del_at:
-                self._scheduler.schedule_deletion(
-                    mint_id=mint_id,
-                    message_id=primary_msg_id,
-                    run_at=del_at,
-                    delete_fn=_run_delete_job,
-                )
-
-        return _send
-
+        await self.alerts.recover()

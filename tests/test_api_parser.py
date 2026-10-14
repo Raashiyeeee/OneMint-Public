@@ -207,7 +207,7 @@ async def test_get_collection_offer_price_calculation(monkeypatch):
         return Decimal("3000")
 
     monkeypatch.setattr(provider, "_get", mock_get)
-    monkeypatch.setattr(provider, "get_eth_price_usd", mock_eth)
+    monkeypatch.setattr(provider, "get_reliable_eth_price_usd", mock_eth)
 
     # 0.002 ETH * 3000 = $6.00
     offer_usd = await provider.get_collection_offer_price("test-collection")
@@ -268,7 +268,7 @@ async def test_get_collection_offer_price_filters_by_contract_address(monkeypatc
     async def mock_eth():
         return Decimal("2000")
 
-    monkeypatch.setattr(provider, "get_eth_price_usd", mock_eth)
+    monkeypatch.setattr(provider, "get_reliable_eth_price_usd", mock_eth)
     matched_usd = await provider.get_collection_offer_price(
         "test-collection",
         contract_address="0xOTHER_CONTRACT",

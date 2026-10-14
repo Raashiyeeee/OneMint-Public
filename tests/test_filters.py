@@ -78,7 +78,7 @@ def make_mint(
     minted_percentage: Decimal | None = Decimal("75"),
     mint_type: str = "public_sale",
     chain: str = "ethereum",
-    start_minutes: int = 15,
+    start_minutes: int = 30,
 ) -> MintOpportunity:
     now = datetime.now(timezone.utc)
     start = now + timedelta(minutes=start_minutes)
@@ -99,157 +99,81 @@ def make_mint(
     )
 
 
-DEFAULT_FILTER_CONFIG = FilterConfig(
-    min_mint_price_usd=Decimal("0"),
-    max_mint_price_usd=Decimal("20"),
-    min_offer_multiplier=Decimal("1.5"),
-    free_mint_min_offer_usd=Decimal("5"),
-    min_minted_percentage=Decimal("70"),
-    allow_sold_out=False,
-)
+DEFAULT_FILTER_CONFIG = FilterConfig()  # spec defaults: $13 cap, 1.40x, 70%
 
 
 def apply_filter(mint: MintOpportunity, config: FilterConfig = DEFAULT_FILTER_CONFIG) -> FilterResult:
     return MintFilter(config).evaluate(mint)
 
 
-# ─── Test 1: Public mint ──────────────────────────────────────────────────────
+# ─── Rule 1a: public only ─────────────────────────────────────────────────────
 
 def test_public_mint_passes():
-    """Test 1: Public mint stage_type qualifies."""
     mint = make_mint(mint_type="public_sale")
     result = apply_filter(mint)
     assert result.passed, f"Expected pass, got: {result.reason}"
 
 
-# ─── Test 2: Private mint ─────────────────────────────────────────────────────
-
 def test_private_mint_rejected():
-    """Test 2: Non-public stage types are rejected."""
     for private_type in ("presale", "allowlist", "private_sale", "fcfs", "whitelist"):
-        mint = make_mint(mint_type=private_type)
-        result = apply_filter(mint)
+        result = apply_filter(make_mint(mint_type=private_type))
         assert not result.passed, f"Expected rejection for mint_type={private_type}"
-        assert result.rule == "RULE1_PUBLIC"
+        assert result.rule == "RULE1A_PUBLIC"
 
 
-# ─── Test 3: $0 mint with sufficient offer ────────────────────────────────────
+# ─── Rule 1b: price <= $13 ────────────────────────────────────────────────────
 
-def test_free_mint_zero_price_passes():
-    """Test 3: $0 mint with $5+ offer qualifies."""
-    mint = make_mint(mint_price_usd=Decimal("0"), offer_price_usd=Decimal("5"))
-    result = apply_filter(mint)
-    assert result.passed
+def test_free_mint_with_credible_offer_passes():
+    """$0 mint: 0 x 1.40 = 0, so any credible (>0) offer satisfies Rule 2."""
+    assert apply_filter(make_mint(mint_price_usd=Decimal("0"), offer_price_usd=Decimal("1"))).passed
 
 
-# ─── Test 4: Free mint with exactly $5 offer ─────────────────────────────────
-
-def test_free_mint_exactly_five_offer():
-    """Test 4: $0 mint with exactly $5 offer — passes."""
-    mint = make_mint(mint_price_usd=Decimal("0"), offer_price_usd=Decimal("5.00"))
-    result = apply_filter(mint)
-    assert result.passed
+def test_thirteen_dollar_mint_boundary_passes():
+    assert apply_filter(make_mint(mint_price_usd=Decimal("13"), offer_price_usd=Decimal("18.20"))).passed
 
 
-# ─── Test 5: Free mint below $5 offer ────────────────────────────────────────
-
-def test_free_mint_below_five_offer():
-    """Test 5: $0 mint with $4.99 offer — rejected."""
-    mint = make_mint(mint_price_usd=Decimal("0"), offer_price_usd=Decimal("4.99"))
-    result = apply_filter(mint)
+def test_above_thirteen_dollar_mint_rejected():
+    result = apply_filter(make_mint(mint_price_usd=Decimal("13.01"), offer_price_usd=Decimal("40")))
     assert not result.passed
-    assert result.rule == "RULE4_FREE_MINT_OFFER"
+    assert result.rule == "RULE1B_PRICE"
 
 
-# ─── Test 6: $10 mint with $15 offer ─────────────────────────────────────────
+# ─── Rule 2: offer >= 1.40x ───────────────────────────────────────────────────
 
-def test_normal_mint_exactly_1_5x_offer():
-    """Test 6: $10 mint with exactly $15 offer — passes."""
-    mint = make_mint(mint_price_usd=Decimal("10"), offer_price_usd=Decimal("15"))
-    result = apply_filter(mint)
-    assert result.passed
+def test_normal_mint_exactly_1_40x_offer():
+    assert apply_filter(make_mint(mint_price_usd=Decimal("10"), offer_price_usd=Decimal("14"))).passed
 
 
-# ─── Test 7: $10 mint below $15 offer ────────────────────────────────────────
-
-def test_normal_mint_below_1_5x_offer():
-    """Test 7: $10 mint with $14.99 offer — rejected."""
-    mint = make_mint(mint_price_usd=Decimal("10"), offer_price_usd=Decimal("14.99"))
-    result = apply_filter(mint)
+def test_normal_mint_below_1_40x_offer():
+    result = apply_filter(make_mint(mint_price_usd=Decimal("10"), offer_price_usd=Decimal("13.99")))
     assert not result.passed
-    assert result.rule == "RULE3_OFFER_RATIO"
+    assert result.rule == "RULE2_OFFER_RATIO"
 
 
-# ─── Test 8: $20 mint ────────────────────────────────────────────────────────
-
-def test_twenty_dollar_mint():
-    """Test 8: $20 mint (boundary) — passes price range, needs $30 offer."""
-    mint = make_mint(mint_price_usd=Decimal("20"), offer_price_usd=Decimal("30"))
-    result = apply_filter(mint)
-    assert result.passed
-
-
-# ─── Test 9: >$20 mint ───────────────────────────────────────────────────────
-
-def test_above_twenty_dollar_mint_rejected():
-    """Test 9: $20.01 mint — rejected by price range."""
-    mint = make_mint(mint_price_usd=Decimal("20.01"), offer_price_usd=Decimal("40"))
-    result = apply_filter(mint)
-    assert not result.passed
-    assert result.rule == "RULE2_PRICE"
-
-
-# ─── Test 10: 70% minted ─────────────────────────────────────────────────────
+# ─── Rule 1c: >= 70% minted ───────────────────────────────────────────────────
 
 def test_seventy_percent_minted():
-    """Test 10: Exactly 70% minted — passes."""
-    mint = make_mint(minted_percentage=Decimal("70"))
-    result = apply_filter(mint)
-    assert result.passed
+    assert apply_filter(make_mint(minted_percentage=Decimal("70"))).passed
 
-
-# ─── Test 11: 69% minted ─────────────────────────────────────────────────────
 
 def test_sixty_nine_percent_minted():
-    """Test 11: 69.9% minted — rejected."""
-    mint = make_mint(minted_percentage=Decimal("69.99"))
-    result = apply_filter(mint)
+    result = apply_filter(make_mint(minted_percentage=Decimal("69.99")))
     assert not result.passed
-    assert result.rule == "RULE5_MINTED"
+    assert result.rule == "RULE1C_MINTED"
 
-
-# ─── Test 12: 99% minted ─────────────────────────────────────────────────────
 
 def test_ninety_nine_percent_minted():
-    """Test 12: 99% minted — passes (not fully sold out)."""
-    mint = make_mint(minted_percentage=Decimal("99"))
-    result = apply_filter(mint)
-    assert result.passed
+    assert apply_filter(make_mint(minted_percentage=Decimal("99"))).passed
 
-
-# ─── Test 13: 100% minted (sold out, not allowed) ────────────────────────────
 
 def test_hundred_percent_minted_sold_out_not_allowed():
-    """Test 13: 100% minted, ALLOW_SOLD_OUT=false — rejected."""
-    mint = make_mint(minted_percentage=Decimal("100"))
-    config = FilterConfig(**{**DEFAULT_FILTER_CONFIG.__dict__, "allow_sold_out": False})
-    result = MintFilter(config).evaluate(mint)
+    result = MintFilter(FilterConfig(allow_sold_out=False)).evaluate(make_mint(minted_percentage=Decimal("100")))
     assert not result.passed
-    assert result.rule == "RULE5_SOLD_OUT"
+    assert result.rule == "RULE1C_SOLD_OUT"
 
 
 def test_hundred_percent_minted_allowed():
-    """Test 13b: 100% minted, ALLOW_SOLD_OUT=true — passes."""
-    mint = make_mint(minted_percentage=Decimal("100"))
-    config = FilterConfig(
-        min_mint_price_usd=Decimal("0"),
-        max_mint_price_usd=Decimal("20"),
-        min_offer_multiplier=Decimal("1.5"),
-        free_mint_min_offer_usd=Decimal("5"),
-        min_minted_percentage=Decimal("70"),
-        allow_sold_out=True,
-    )
-    result = MintFilter(config).evaluate(mint)
+    result = MintFilter(FilterConfig(allow_sold_out=True)).evaluate(make_mint(minted_percentage=Decimal("100")))
     assert result.passed
 
 
@@ -396,82 +320,24 @@ async def test_api_500_retried():
     assert result == "ok"
 
 
-# ─── Test 20: Late detection ─────────────────────────────────────────────────
-
-def test_late_detection_case1_normal():
-    """Test 20a: Mint > 10 min away — notification time is 10 min before start."""
-    from app.utils.time import notification_time
-    start = utcnow() + timedelta(minutes=20)
-    notif_at = notification_time(start, before_minutes=10)
-    assert notif_at < start
-    diff = (start - notif_at).total_seconds() / 60
-    assert abs(diff - 10) < 0.1
-
-
-def test_late_detection_case4_expired():
-    """Test 20d: Mint started > 15 min ago — expired."""
-    from app.utils.time import delete_time
-    start = utcnow() - timedelta(minutes=20)
-    del_at = delete_time(start, after_minutes=15)
-    assert del_at < utcnow()  # delete time already passed
-
-
-# ─── Test 21: Notification scheduling ────────────────────────────────────────
+# ─── Timing formulas (rules 3 & 4) ────────────────────────────────────────────
 
 def test_notification_scheduling_formula():
-    """Test 21: Notification is exactly 10 minutes before mint start."""
-    from app.utils.time import notification_time
+    """Alert is exactly 15 minutes before mint start."""
     start = utcnow() + timedelta(hours=1)
-    notif = notification_time(start, before_minutes=10)
-    diff_seconds = (start - notif).total_seconds()
-    assert diff_seconds == 600
+    assert (start - notification_time(start)).total_seconds() == 900
 
-
-# ─── Test 22: Message deletion ───────────────────────────────────────────────
 
 def test_deletion_formula():
-    """Test 22: Deletion is exactly 15 minutes after mint start."""
-    from app.utils.time import delete_time
+    """Deletion is exactly 10 minutes after mint start."""
     start = utcnow() + timedelta(hours=1)
-    del_at = delete_time(start, after_minutes=15)
-    diff = (del_at - start).total_seconds()
-    assert diff == 900  # 15 * 60
+    assert (delete_time(start) - start).total_seconds() == 600
 
 
 def test_deletion_not_relative_to_notification():
-    """Test 22b: Deletion is from mint_start + 15, NOT notification_time + 25."""
-    from app.utils.time import delete_time, notification_time
+    """Deletion = mint_start + 10, i.e. 25 min after the alert, not alert + 10."""
     start = utcnow() + timedelta(hours=1)
-    notif = notification_time(start, 10)
-    del_at = delete_time(start, 15)
-    # From notification: would be notif + 25min = start + 15min — same result
-    # But the formula must use mint_start, not notification_time
-    expected_del = start + timedelta(minutes=15)
-    assert abs((del_at - expected_del).total_seconds()) < 1
-
-
-# ─── Test 23: Restart recovery ───────────────────────────────────────────────
-
-def test_restart_recovery_logic():
-    """Test 23: Recovery correctly categorizes mints based on current time."""
-    from app.utils.time import delete_time, notification_time
-
-    # Scenario: mint starts in 5 minutes (should send immediately on restart)
-    start_case2 = utcnow() + timedelta(minutes=5)
-    notif_at = notification_time(start_case2, 10)
-    del_at = delete_time(start_case2, 15)
-    assert notif_at < utcnow()   # Should have been sent already
-    assert del_at > utcnow()     # Deletion still in future
-
-    # Scenario: mint started 10 minutes ago (still within 15-min window)
-    start_case3 = utcnow() - timedelta(minutes=10)
-    del_at3 = delete_time(start_case3, 15)
-    assert del_at3 > utcnow()    # Still has 5 minutes
-
-    # Scenario: mint started 20 minutes ago (expired)
-    start_case4 = utcnow() - timedelta(minutes=20)
-    del_at4 = delete_time(start_case4, 15)
-    assert del_at4 < utcnow()    # Fully expired
+    assert delete_time(start) - notification_time(start) == timedelta(minutes=25)
 
 
 # ─── Test 24: Telegram topic targeting ───────────────────────────────────────
@@ -501,7 +367,7 @@ async def test_telegram_topic_targeting():
         minted_percentage="75",
         total_supply=1000,
         minted_quantity=750,
-        mint_start_time=datetime.now(timezone.utc) + timedelta(minutes=10),
+        mint_start_time=datetime.now(timezone.utc) + timedelta(minutes=30),
         mint_url="https://opensea.io/collection/test",
         status="SCHEDULED",
     )
@@ -572,7 +438,7 @@ def test_chain_by_api_id():
 def test_acceptance_scenario():
     """
     Full acceptance test: Example Collection on Ethereum.
-    $10 mint, $20 offer, 75% minted, starts in 10 minutes.
+    $10 mint, $20 offer, 75% minted, starts in 30 minutes.
     Expected: ALL rules pass.
     """
     mint = MintOpportunity(
@@ -586,7 +452,7 @@ def test_acceptance_scenario():
         minted_percentage=Decimal("75"),
         total_supply=1000,
         minted_quantity=750,
-        mint_start_time=datetime.now(timezone.utc) + timedelta(minutes=10),
+        mint_start_time=datetime.now(timezone.utc) + timedelta(minutes=30),
         mint_url="https://opensea.io/collection/example",
         collection_slug="example",
     )
@@ -596,11 +462,7 @@ def test_acceptance_scenario():
 
     # Verify timing calculations
     from app.utils.time import delete_time, notification_time
-    notif_at = notification_time(mint.mint_start_time, 10)
-    del_at = delete_time(mint.mint_start_time, 15)
-
-    # Notification should be exactly 10 min before start
-    assert abs((mint.mint_start_time - notif_at).total_seconds() - 600) < 1
-
-    # Deletion should be exactly 15 min after start
-    assert abs((del_at - mint.mint_start_time).total_seconds() - 900) < 1
+    notif_at = notification_time(mint.mint_start_time)
+    del_at = delete_time(mint.mint_start_time)
+    assert (mint.mint_start_time - notif_at).total_seconds() == 900
+    assert (del_at - mint.mint_start_time).total_seconds() == 600

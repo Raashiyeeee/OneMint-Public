@@ -9,9 +9,9 @@ auto-deleting alerts to a configured Telegram group topic.
 ## Features
 
 - **Monitors 15 chains** via OpenSea v2 API with cursor-based pagination
-- **Filters** by public mint type, price ($0–$20), offer ratio, and minted supply (≥70%)
-- **Scheduled alerts** sent exactly 10 minutes before mint start
-- **Auto-deletion** exactly 15 minutes after mint start
+- **Filters** public mints only (no whitelist/allowlist), price ≤ $13, offer ≥ 1.40× mint price, minted supply ≥ 70%, confirmed start time
+- **One alert** per mint phase, sent at mint start − 15 minutes after re-checking every rule (never on discovery)
+- **Auto-deletion** at mint start + 10 minutes (rescheduled if the start time changes; recovered after restarts)
 - **Persistent scheduler** (APScheduler + SQLite) — survives server restarts
 - **Restart recovery** — reschedules missed jobs on startup
 - **Duplicate prevention** via database unique constraints
@@ -202,14 +202,12 @@ All settings are loaded from environment variables. Copy `.env.example` to `.env
 | `MONITOR_ALL_CHAINS` | `true` | Monitor all enabled chains |
 | `ENABLED_CHAINS` | *(all 15)* | Comma-separated chain slugs |
 | `POLL_INTERVAL_SECONDS` | `45` | API polling interval (30–60) |
-| `MIN_MINT_PRICE_USD` | `0` | Minimum mint price |
-| `MAX_MINT_PRICE_USD` | `20` | Maximum mint price |
-| `MIN_OFFER_MULTIPLIER` | `1.5` | Offer/price ratio for paid mints |
-| `FREE_MINT_MIN_OFFER_USD` | `5` | Minimum offer for free mints |
-| `MIN_MINTED_PERCENTAGE` | `70` | Minimum minted % required |
+| `MAX_MINT_PRICE_USD` | `13` | Maximum mint price (spec cap; may only be lowered) |
+| `MIN_OFFER_MULTIPLIER` | `1.40` | Offer ≥ price × this, gross (spec floor; may only be raised) |
+| `MIN_MINTED_PERCENTAGE` | `70` | Minimum minted % (spec floor; may only be raised) |
 | `ALLOW_SOLD_OUT` | `false` | Allow 100% minted drops |
-| `NOTIFICATION_BEFORE_MINUTES` | `10` | Minutes before mint to notify |
-| `DELETE_AFTER_MINUTES` | `15` | Minutes after mint to delete alert |
+
+Alert timing is fixed by spec (alert at start − 15 min, delete at start + 10 min).
 | `DATABASE_URL` | SQLite | SQLAlchemy async database URL |
 | `TEST_MODE` | `false` | Enable test mode with mock data |
 | `LOG_LEVEL` | `INFO` | Python logging level |
@@ -218,36 +216,22 @@ All settings are loaded from environment variables. Copy `.env.example` to `.env
 
 ## Filtering Logic
 
-```
-Public? (stage_type = public_sale)
-  ├── NO → SKIP
-  └── YES
-      ↓
-Price $0–$20?
-  ├── NO → SKIP
-  └── YES
-      ↓
-Price > $0 → offer >= price × 1.5?   (Rule 3)
-Price = $0 → offer >= $5?            (Rule 4)
-  ├── NO → SKIP
-  └── YES
-      ↓
-Minted >= 70%?
-  ├── NO → SKIP
-  └── YES
-      ↓
-Sold out & ALLOW_SOLD_OUT=false?
-  ├── YES → SKIP
-  └── NO
-      ↓
-Duplicate?
-  ├── YES → SKIP
-  └── NO
-      ↓
-SCHEDULE → NOTIFY → DELETE
-```
+See `app/rules.py` and `app/filters/mint_filter.py`. Every check is a hard
+requirement; missing data never passes.
 
----
+1. Public stage only — `stage_type` public **and** not labelled/configured as
+   whitelist / allowlist / presale / GTD / OG / FCFS.
+2. Mint price known, ETH-denominated, converted with a live ETH/USD rate, ≤ $13.
+3. ≥ 70% of total supply minted (supply data required).
+4. Start time confirmed: timezone-aware, in the future, before stage end,
+   within 180 days.
+5. A credible offer exists (> $0, active, unexpired, matching the contract,
+   in a known currency).
+6. Offer ≥ mint price × 1.40 (exact, gross before fees).
+
+Discovery only *schedules*. At mint start − 15 min every rule is re-checked with
+fresh data; the alert is sent once, only to `TELEGRAM_GROUP_ID` /
+`PUBLIC_MINT_TOPIC_ID`, and deleted at mint start + 10 min.
 
 ## Running Tests
 

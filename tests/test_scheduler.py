@@ -123,19 +123,37 @@ async def test_scheduler_schedule_notification():
 
 @pytest.mark.asyncio
 async def test_scheduler_no_duplicate_jobs():
-    """Scheduling the same mint_id twice does not create a duplicate job."""
+    """Scheduling the same mint at the same time twice does not add a second job."""
     from app.monitor.scheduler import MintScheduler
 
     scheduler = MintScheduler(db_url="sqlite:///./test_scheduler.db")
-
+    run_at = (utcnow() + timedelta(minutes=5)).replace(microsecond=0)
     existing_job = MagicMock()
+    existing_job.next_run_time = run_at
     with patch.object(scheduler._scheduler, "get_job", return_value=existing_job):
         with patch.object(scheduler._scheduler, "add_job") as mock_add:
             job_id = scheduler.schedule_notification(
-                mint_id="existing-mint",
-                run_at=utcnow() + timedelta(minutes=5),
-                send_fn=AsyncMock(),
+                mint_id="existing-mint", run_at=run_at, send_fn=AsyncMock(),
             )
 
     assert job_id == "notify_existing-mint"
-    mock_add.assert_not_called()  # Should not add if job exists
+    mock_add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_reschedules_when_time_changes():
+    """Rule 5: a changed start time replaces the existing job (same id)."""
+    from app.monitor.scheduler import MintScheduler
+
+    scheduler = MintScheduler(db_url="sqlite:///./test_scheduler.db")
+    existing_job = MagicMock()
+    existing_job.next_run_time = utcnow() + timedelta(minutes=5)
+    new_time = utcnow() + timedelta(minutes=50)
+    with patch.object(scheduler._scheduler, "get_job", return_value=existing_job):
+        with patch.object(scheduler._scheduler, "add_job") as mock_add:
+            scheduler.schedule_notification(mint_id="m", run_at=new_time, send_fn=AsyncMock())
+            scheduler.schedule_deletion(mint_id="m", message_id=1, run_at=new_time, delete_fn=AsyncMock())
+    assert mock_add.call_count == 2
+    for call in mock_add.call_args_list:
+        assert call.kwargs["replace_existing"] is True
+        assert call.kwargs["run_date"] == new_time
