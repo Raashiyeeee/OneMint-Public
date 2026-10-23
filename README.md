@@ -1,332 +1,157 @@
-# Public Mint Link Bot
+# OneMint - OpenSea Public Mint Alert Bot
 
-A production-ready Telegram automation bot that continuously monitors the OpenSea API
-for qualifying public NFT mints across 15 blockchain networks and delivers scheduled,
-auto-deleting alerts to a configured Telegram group topic.
+An automated Python bot that monitors OpenSea for qualifying public NFT mints across 15 blockchain networks. When a mint meets strict liquidity and resale criteria, it sends a scheduled alert to your Telegram group topic 15 minutes before the mint begins, then automatically deletes the message 10 minutes after launch to keep your chat clutter-free.
 
 ---
 
-## Features
+## How It Works
 
-- **Monitors 15 chains** via OpenSea v2 API with cursor-based pagination
-- **Filters** public mints only (no whitelist/allowlist), price ≤ $13, offer ≥ 1.40× mint price, minted supply ≥ 70%, confirmed start time
-- **Two alerts** per mint phase: immediate when fully qualified, plus a reminder at mint start − 15 minutes (re-checked before the reminder)
-- **Auto-deletion** at mint start + 10 minutes (rescheduled if the start time changes; recovered after restarts)
-- **Persistent scheduler** (APScheduler + SQLite) — survives server restarts
-- **Restart recovery** — reschedules missed jobs on startup
-- **Duplicate prevention** via database unique constraints
-- **Exponential-backoff retry** for API errors (429, 5xx, timeouts)
-- **Telegram forum topic** targeting via `message_thread_id`
-- **Admin commands**: `/status`, `/monitor on|off`, `/test`
-- **Graceful shutdown** (SIGTERM/SIGINT)
-- **Docker + systemd** deployment
+1. **Continuous Scanning**: Polls OpenSea v2 API across supported chains (Base, Ethereum, Polygon, Arbitrum, Ink, Robinhood, etc.).
+2. **Strict Filtering**: Checks every drop against strict criteria (no pass-through on missing data):
+   - **Public Only**: Strictly public stages. Skips whitelist, allowlist, presale, or token-gated tiers.
+   - **Price Cap**: Mint price must be $\le$ $13 USD.
+   - **Resale Spread**: Active collection offer or floor must be at least **1.40×** the mint price.
+   - **Mint Progress**: At least **70%** of total supply must already be minted.
+3. **Timed Alerts**:
+   - Sends an alert immediately when discovered as qualified, plus a reminder **15 minutes before mint starts** (after re-verifying fresh market data).
+   - **Auto-Deletes at mint start + 10 minutes** so outdated callouts don't linger in your Telegram group.
+4. **Crash-Proof State**: Uses SQLite/PostgreSQL with APScheduler to persist alert timers across server restarts.
 
 ---
 
-## Supported Chains
+## Supported Networks
 
-| Chain | API Identifier | Supported |
-|-------|---------------|-----------|
-| Base | `base` | ✅ |
-| Ethereum | `ethereum` | ✅ |
-| Polygon | `polygon` | ✅ |
-| Arbitrum | `arbitrum` | ✅ |
-| Optimism | `optimism` | ✅ |
-| Zora | `zora` | ✅ |
-| Robinhood | `robinhood` | ✅ |
-| Avalanche | `avalanche` | ✅ |
-| BSC | *(none)* | ⚠️ Not in OpenSea API |
-| Shape | `shape` | ✅ |
-| Abstract | `abstract` | ✅ |
-| ApeChain | `ape_chain` | ✅ |
-| Arc | `arc` | ✅ |
-| HyperEVM | `hyperevm` | ✅ |
-| Ink | `ink` | ✅ |
-
-> **Note:** BSC is not supported by OpenSea. It is monitored as an enabled chain but skipped during API polling with a `[CHAIN_UNSUPPORTED]` log entry.
+- **Layer 2s & EVM Chains**: Base, Arbitrum, Optimism, Polygon, Zora, Ink, Shape, Abstract, ApeChain, HyperEVM, Arc, Robinhood Chain, Avalanche.
+- **L1**: Ethereum Mainnet.
+- *(Note: BSC is in the chain registry but currently unsupported by OpenSea's drop endpoints).*
 
 ---
 
-## Quick Start
+## Quick Setup
 
-### Prerequisites
-
+### 1. Requirements
 - Python 3.11+
-- A Telegram bot token (from [@BotFather](https://t.me/BotFather))
-- A Telegram group with a forum topic enabled
-- An OpenSea API key
+- Telegram Bot Token (from [@BotFather](https://t.me/BotFather))
+- Telegram Group with Topics enabled
+- OpenSea API Key
 
-### 1. Clone and configure
-
-```bash
-git clone <repo-url>
-cd public-mint-bot
-
-cp .env.example .env
-# Edit .env with your actual values
-nano .env
-```
-
-### 2. Install dependencies
+### 2. Install & Configure
 
 ```bash
-python -m venv .venv
+git clone https://github.com/Raashiyeeee/OneMint-Public.git
+cd OneMint-Public
+
+# Create virtual environment
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Run
+### 3. Setup Environment Variables
 
+```bash
+cp .env.example .env
+```
+
+Open `.env` and fill in your keys:
+
+```env
+# Telegram
+TELEGRAM_BOT_TOKEN=123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ
+TELEGRAM_GROUP_ID=-1001234567890
+PUBLIC_MINT_TOPIC_ID=12345
+ADMIN_USER_IDS=123456789
+
+# OpenSea API
+OPENSEA_API_KEY=your_opensea_key_here
+OPENSEA_API_ENDPOINT=https://api.opensea.io/api/v2
+
+# Polling Interval (in seconds)
+POLL_INTERVAL_SECONDS=45
+
+# Rules (defaults match the strategy floor)
+MAX_MINT_PRICE_USD=13
+MIN_OFFER_MULTIPLIER=1.40
+MIN_MINTED_PERCENTAGE=70
+```
+
+---
+
+## Running the Bot
+
+### Local Development
 ```bash
 python -m app.main
 ```
 
----
-
-## Docker Deployment
-
-### Build and start
-
+### Docker Deployment
 ```bash
-docker-compose up -d --build
-```
+# Build and run in background
+docker compose up -d --build
 
-### View logs
-
-```bash
-docker-compose logs -f public-mint-bot
-```
-
-### Stop
-
-```bash
-docker-compose down
-```
-
-### Restart
-
-```bash
-docker-compose restart public-mint-bot
-```
-
-### Update
-
-```bash
-git pull
-docker-compose up -d --build
-```
-
----
-
-## AWS Linux + systemd Deployment
-
-### 1. Create the bot user
-
-```bash
-sudo useradd -r -s /bin/false botuser
-sudo mkdir -p /opt/public-mint-bot/data
-```
-
-### 2. Deploy application
-
-```bash
-sudo cp -r . /opt/public-mint-bot/
-sudo chown -R botuser:botuser /opt/public-mint-bot
-```
-
-### 3. Set up Python environment
-
-```bash
-sudo -u botuser python3.11 -m venv /opt/public-mint-bot/.venv
-sudo -u botuser /opt/public-mint-bot/.venv/bin/pip install -r /opt/public-mint-bot/requirements.txt
-```
-
-### 4. Configure environment
-
-```bash
-sudo cp /opt/public-mint-bot/.env.example /opt/public-mint-bot/.env
-sudo nano /opt/public-mint-bot/.env
-# Fill in TELEGRAM_BOT_TOKEN, OPENSEA_API_KEY, etc.
-sudo chmod 600 /opt/public-mint-bot/.env
-```
-
-### 5. Install systemd service
-
-```bash
-sudo cp systemd/public-mint-bot.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable public-mint-bot
-sudo systemctl start public-mint-bot
-```
-
-### Service management
-
-```bash
-# Start
-sudo systemctl start public-mint-bot
+# View logs
+docker compose logs -f public-mint-bot
 
 # Stop
-sudo systemctl stop public-mint-bot
-
-# Restart
-sudo systemctl restart public-mint-bot
-
-# Status
-sudo systemctl status public-mint-bot
-
-# View logs (live)
-sudo journalctl -u public-mint-bot -f
-
-# View last 100 lines
-sudo journalctl -u public-mint-bot -n 100
-
-# Update and restart
-git -C /opt/public-mint-bot pull
-sudo systemctl restart public-mint-bot
+docker compose down
 ```
 
----
-
-## Configuration Reference
-
-All settings are loaded from environment variables. Copy `.env.example` to `.env`.
-
-| Variable | Default | Description |
-|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | *(required)* | Bot API token from BotFather |
-| `TELEGRAM_GROUP_ID` | *(required)* | Target group/channel ID |
-| `PUBLIC_MINT_TOPIC_ID` | *(required)* | Forum topic ID for alerts |
-| `ADMIN_USER_IDS` | `""` | Comma-separated admin Telegram user IDs |
-| `OPENSEA_API_KEY` | *(required)* | OpenSea API key |
-| `OPENSEA_API_ENDPOINT` | `https://api.opensea.io/api/v2` | API base URL |
-| `MONITOR_ALL_CHAINS` | `true` | Monitor all enabled chains |
-| `ENABLED_CHAINS` | *(all 15)* | Comma-separated chain slugs |
-| `POLL_INTERVAL_SECONDS` | `45` | API polling interval (30–60) |
-| `MAX_MINT_PRICE_USD` | `13` | Maximum mint price (spec cap; may only be lowered) |
-| `MIN_OFFER_MULTIPLIER` | `1.40` | Offer ≥ price × this, gross (spec floor; may only be raised) |
-| `MIN_MINTED_PERCENTAGE` | `70` | Minimum minted % (spec floor; may only be raised) |
-| `ALLOW_SOLD_OUT` | `false` | Allow 100% minted drops |
-
-Alert timing is fixed by spec (alert at start − 15 min, delete at start + 10 min).
-| `DATABASE_URL` | SQLite | SQLAlchemy async database URL |
-| `TEST_MODE` | `false` | Enable test mode with mock data |
-| `LOG_LEVEL` | `INFO` | Python logging level |
+### Cloud Deployment (Render Blueprint)
+This repo includes a pre-configured `render.yaml`:
+1. Connect this repo to [Render](https://render.com).
+2. Create a new **Blueprint Instance**.
+3. Under Environment Variables in the Render dashboard, add your `TELEGRAM_BOT_TOKEN`, `OPENSEA_API_KEY`, and `TELEGRAM_GROUP_ID`.
 
 ---
 
-## Filtering Logic
+## Telegram Bot Commands
 
-See `app/rules.py` and `app/filters/mint_filter.py`. Every check is a hard
-requirement; missing data never passes.
+| Command | Who Can Use | Description |
+| :--- | :---: | :--- |
+| `/start` | Everyone | Basic greeting and bot information |
+| `/status` | Admin | Shows API health, database status, and active scheduled jobs |
+| `/monitor on` | Admin | Resumes OpenSea polling loop |
+| `/monitor off` | Admin | Pauses polling without taking the bot offline |
+| `/test` | Admin | Sends a sample test alert to verify Telegram permissions |
+| `/sendtoday` | Admin | Forces an immediate scan and broadcasts any eligible mints today |
 
-1. Public stage only — `stage_type` public **and** not labelled/configured as
-   whitelist / allowlist / presale / GTD / OG / FCFS.
-2. Mint price known, ETH-denominated, converted with a live ETH/USD rate, ≤ $13.
-3. ≥ 70% of total supply minted (supply data required).
-4. Start time confirmed: timezone-aware, in the future, before stage end,
-   within 180 days.
-5. A credible offer exists (> $0, active, unexpired, matching the contract,
-   in a known currency).
-6. Offer ≥ mint price × 1.40 (exact, gross before fees).
+---
 
-Discovery only *schedules*. At mint start − 15 min every rule is re-checked with
-fresh data; the alert is sent once, only to `TELEGRAM_GROUP_ID` /
-`PUBLIC_MINT_TOPIC_ID`, and deleted at mint start + 10 min.
+## Testing
 
-## Running Tests
+Run the full automated test suite (mocked data, no live API credits consumed):
 
 ```bash
-# Install test dependencies
-pip install -r requirements.txt
-
-# Run all tests
+# Run tests
 pytest
 
-# Run with coverage
-pytest --cov=app --cov-report=term-missing
+# Run with verbose output
+pytest -v
 
-# Run specific test file
+# Run specific filter tests
 pytest tests/test_filters.py -v
 ```
 
 ---
 
-## Admin Commands
+## Project Structure
 
-| Command | Description | Admin Only |
-|---|---|---|
-| `/start` | Greeting and bot info | No |
-| `/status` | Bot and monitor health metrics | Yes |
-| `/monitor on` | Enable polling | Yes |
-| `/monitor off` | Pause polling (bot stays active) | Yes |
-| `/test` | Send a test alert to the topic | Yes |
-
----
-
-## Architecture
-
-```
+```text
 app/
-├── main.py              # Entry point, startup/shutdown orchestration
-├── config.py            # Environment-based configuration (pydantic-settings)
-│
-├── bot/                 # Telegram bot layer
-│   ├── bot.py           # Application factory
-│   └── handlers.py      # Command handlers
-│
-├── providers/           # API abstraction
-│   ├── base.py          # Abstract provider interface + raw models
-│   └── opensea.py       # OpenSea v2 implementation
-│
-├── chains/              # Chain registry
-│   ├── registry.py      # Single source of truth for 15 chains
-│   └── models.py        # Pydantic chain model
-│
-├── monitor/             # Core monitoring engine
-│   ├── monitor.py       # Main polling loop + recovery
-│   ├── processor.py     # Single-mint pipeline
-│   └── scheduler.py     # APScheduler wrapper
-│
-├── filters/             # Filtering engine
-│   └── mint_filter.py   # All 5 filtering rules
-│
-├── models/              # Normalised internal models
-│   ├── mint.py          # MintOpportunity + MintStatus
-│   └── notification.py  # NotificationRecord
-│
-├── database/            # Data layer
-│   ├── database.py      # Engine + session factory
-│   ├── models.py        # SQLAlchemy ORM models
-│   └── repository.py    # All DB read/write operations
-│
-├── services/            # Business services
-│   ├── notification_service.py
-│   ├── mint_service.py
-│   └── health_service.py
-│
-└── utils/               # Shared utilities
-    ├── retry.py         # Exponential backoff
-    ├── time.py          # UTC time helpers
-    └── logging.py       # Logging setup
+├── main.py              # Application lifecycle and webhook/polling init
+├── config.py            # Pydantic environment configuration
+├── bot/                 # Telegram bot handlers and message formatting
+├── monitor/             # OpenSea polling loop, pipelines, and APScheduler
+├── filters/             # Strict public eligibility and multiplier checks
+├── providers/           # OpenSea v2 API integration
+├── chains/              # Multi-chain registry and metadata
+├── database/            # SQLAlchemy models, sessions, and recovery queries
+├── services/            # Alert delivery, cleanup, and health metrics
+└── utils/               # Retries, backoff, and UTC time calculations
 ```
 
 ---
 
-## API Limitations
+## License
 
-1. **BSC (Binance Smart Chain):** Not in the OpenSea v2 `ChainIdentifier` enum. Monitored in config but skipped during API polling.
-2. **Offer Price:** OpenSea drops API does not expose offer prices. The collection floor price (cheapest listing) from `/api/v2/collections/{slug}/stats` is used as a proxy. See `docs/API_FIELD_MAPPING.md`.
-3. **Supply data:** `total_supply` and `max_supply` are only available in the `/drops/{slug}` detail endpoint, requiring an additional API call per discovered drop.
-4. **Minted quantity:** OpenSea uses inverted naming — their `total_supply` field = minted count, `max_supply` = total cap.
-5. **Arc chain:** Present in the ChainIdentifier enum but may return no drops at present.
-
----
-
-## Security Notes
-
-- API keys and bot tokens are never logged or hard-coded
-- Admin commands restricted to `ADMIN_USER_IDS`
-- All dynamic Telegram content is HTML-escaped
-- Database credential patterns compatible with least-privilege access
-- Non-root Docker user (`botuser`)
-- systemd `NoNewPrivileges=yes`, `ProtectSystem=strict`
+MIT License. Provided as-is for educational and personal automation purposes. Always verify contract addresses before minting.
